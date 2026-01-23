@@ -279,7 +279,7 @@ class DropletAnalyzer:
             droplet_count = 0
             density_str = ""
             if viewer_state['show_droplets']:
-                count, droplet_locations = self.detect_droplets(
+                count, droplet_data = self.detect_droplets(
                     frame,
                     viewer_state['threshold'],
                     viewer_state['min_area'],
@@ -291,10 +291,33 @@ class DropletAnalyzer:
                 roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
                 density = droplet_count / roi_area
 
-                # Draw circles around detected droplets
-                for x, y, radius in droplet_locations:
+                # Draw circles around detected droplets with length/width lines
+                for droplet in droplet_data:
+                    x = droplet['x']
+                    y = droplet['y']
+                    radius = droplet['radius']
+                    length = droplet['length']
+                    width = droplet['width']
+                    angle = droplet['angle']
+
                     circle = plt.Circle((x, y), radius * 10, fill=False, edgecolor='lime', linewidth=0.5)
                     ax.add_patch(circle)
+
+                    # Draw length line (major axis) - red
+                    angle_rad = np.deg2rad(angle)
+                    length_dx = (length / 2) * np.cos(angle_rad)
+                    length_dy = (length / 2) * np.sin(angle_rad)
+                    ax.plot([x - length_dx, x + length_dx],
+                           [y - length_dy, y + length_dy],
+                           'r-', linewidth=1, alpha=0.8)
+
+                    # Draw width line (minor axis) - blue
+                    width_angle_rad = angle_rad + np.pi/2
+                    width_dx = (width / 2) * np.cos(width_angle_rad)
+                    width_dy = (width / 2) * np.sin(width_angle_rad)
+                    ax.plot([x - width_dx, x + width_dx],
+                           [y - width_dy, y + width_dy],
+                           'b-', linewidth=1, alpha=0.8)
 
                 density_str = f" | Density: {density:.2e}/px²"
 
@@ -896,7 +919,7 @@ class DropletAnalyzer:
         frame_num = first_frame_info['frame_number']
         time_sec = first_frame_info['time_seconds']
         droplet_count = first_frame_info['droplet_count']
-        droplet_locations = first_frame_info.get('droplet_locations', [])
+        droplets = first_frame_info.get('droplets', [])
 
         # Open video and read the first frame
         cap = cv2.VideoCapture(self.video_path)
@@ -923,11 +946,34 @@ class DropletAnalyzer:
                              fill=False, edgecolor='red', linewidth=3, label='Analysis ROI')
         ax.add_patch(rect)
 
-        # Draw circles around detected droplets
-        for i, (x, y, radius) in enumerate(droplet_locations):
+        # Draw circles around detected droplets with length/width annotations
+        for i, droplet in enumerate(droplets):
+            x = droplet['x']
+            y = droplet['y']
+            radius = droplet['radius']
+            length = droplet['length']
+            width = droplet['width']
+            angle = droplet['angle']
+
             label = 'Detected Droplets' if i == 0 else None
             circle = plt.Circle((x, y), radius * 3, fill=False, edgecolor='lime', linewidth=1, label=label)
             ax.add_patch(circle)
+
+            # Draw length line (major axis)
+            angle_rad = np.deg2rad(angle)
+            length_dx = (length / 2) * np.cos(angle_rad)
+            length_dy = (length / 2) * np.sin(angle_rad)
+            ax.plot([x - length_dx, x + length_dx],
+                   [y - length_dy, y + length_dy],
+                   'r-', linewidth=1.5, alpha=0.7)
+
+            # Draw width line (minor axis, perpendicular to length)
+            width_angle_rad = angle_rad + np.pi/2
+            width_dx = (width / 2) * np.cos(width_angle_rad)
+            width_dy = (width / 2) * np.sin(width_angle_rad)
+            ax.plot([x - width_dx, x + width_dx],
+                   [y - width_dy, y + width_dy],
+                   'b-', linewidth=1.5, alpha=0.7)
 
         # Calculate density
         roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
@@ -1048,6 +1094,159 @@ class DropletAnalyzer:
         print(f"\nResults saved to: {output_path}")
 
         return results
+
+    def save_droplet_data_numpy(self, output_path):
+        """
+        Save per-droplet data to a numpy binary file.
+
+        Creates a structured array with one entry per droplet across all frames.
+        Each entry contains: frame_number, droplet_id, x, y, length, width
+
+        Args:
+            output_path: Path to save the .npy or .npz file
+        """
+        if not self.frame_data:
+            raise ValueError("No data to save. Run analyze() first.")
+
+        # Collect all droplet data
+        all_droplets = []
+
+        for frame_info in self.frame_data:
+            frame_num = frame_info['frame_number']
+            droplets = frame_info.get('droplets', [])
+
+            for droplet_id, droplet in enumerate(droplets):
+                all_droplets.append({
+                    'frame': frame_num,
+                    'droplet_id': droplet_id,
+                    'x': droplet['x'],
+                    'y': droplet['y'],
+                    'length': droplet['length'],
+                    'width': droplet['width'],
+                    'angle': droplet['angle']
+                })
+
+        # Convert to structured numpy array
+        dtype = [('frame', 'i4'), ('droplet_id', 'i4'), ('x', 'f4'), ('y', 'f4'),
+                 ('length', 'f4'), ('width', 'f4'), ('angle', 'f4')]
+
+        droplet_array = np.array([(d['frame'], d['droplet_id'], d['x'], d['y'],
+                                   d['length'], d['width'], d['angle'])
+                                  for d in all_droplets], dtype=dtype)
+
+        # Save to file
+        np.save(output_path, droplet_array)
+        print(f"\nDroplet data saved to: {output_path}")
+        print(f"Total droplets across all frames: {len(droplet_array)}")
+
+        return droplet_array
+
+    def plot_histograms(self, save_path=None):
+        """
+        Create three histograms:
+        1. Droplet count per frame with twin axis for density
+        2. Streak length distribution (all droplets)
+        3. Streak width distribution (all droplets)
+
+        Args:
+            save_path: Optional path to save the plot. If None, displays interactively.
+        """
+        if not self.frame_data:
+            raise ValueError("No data to plot. Run analyze() first.")
+
+        # Collect data
+        counts = []
+        lengths = []
+        widths = []
+
+        for frame_info in self.frame_data:
+            counts.append(frame_info['droplet_count'])
+            droplets = frame_info.get('droplets', [])
+
+            for droplet in droplets:
+                lengths.append(droplet['length'])
+                widths.append(droplet['width'])
+
+        # Calculate ROI area for density
+        roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
+
+        # Create figure with 3 subplots
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Histogram 1: Droplet count per frame with density twin axis
+        ax1_twin = ax1.twinx()
+
+        _, bins1, _ = ax1.hist(counts, bins=30, alpha=0.7, color='blue', edgecolor='black')
+        ax1.set_xlabel('Droplet Count per Frame', fontsize=12)
+        ax1.set_ylabel('Frequency (Number of Frames)', fontsize=12, color='blue')
+        ax1.tick_params(axis='y', labelcolor='blue')
+        ax1.set_title('Droplet Count Distribution', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+
+        # Twin axis for density
+        densities = np.array(counts) / roi_area
+        ax1_twin.hist(densities, bins=bins1, alpha=0.3, color='red', edgecolor='black')
+        ax1_twin.set_ylabel('Density (droplets/px²)', fontsize=12, color='red')
+        ax1_twin.tick_params(axis='y', labelcolor='red')
+
+        # Add statistics to plot
+        mean_count = np.mean(counts)
+        std_count = np.std(counts)
+        ax1.axvline(mean_count, color='darkblue', linestyle='--', linewidth=2,
+                   label=f'Mean: {mean_count:.1f} ± {std_count:.1f}')
+        ax1.legend(fontsize=10)
+
+        # Histogram 2: Streak length
+        ax2.hist(lengths, bins=40, alpha=0.7, color='green', edgecolor='black')
+        ax2.set_xlabel('Streak Length (pixels)', fontsize=12)
+        ax2.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
+        ax2.set_title('Streak Length Distribution', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+
+        # Add statistics
+        mean_length = np.mean(lengths)
+        std_length = np.std(lengths)
+        ax2.axvline(mean_length, color='darkgreen', linestyle='--', linewidth=2,
+                   label=f'Mean: {mean_length:.2f} ± {std_length:.2f} px')
+        ax2.legend(fontsize=10)
+
+        # Histogram 3: Streak width
+        ax3.hist(widths, bins=40, alpha=0.7, color='orange', edgecolor='black')
+        ax3.set_xlabel('Streak Width at Midpoint (pixels)', fontsize=12)
+        ax3.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
+        ax3.set_title('Streak Width Distribution', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+
+        # Add statistics
+        mean_width = np.mean(widths)
+        std_width = np.std(widths)
+        ax3.axvline(mean_width, color='darkorange', linestyle='--', linewidth=2,
+                   label=f'Mean: {mean_width:.2f} ± {std_width:.2f} px')
+        ax3.legend(fontsize=10)
+
+        # Add overall statistics text
+        total_droplets = len(lengths)
+        fig.suptitle(f'Droplet Analysis Summary - {self.frames_analyzed} frames analyzed, '
+                    f'{total_droplets} total droplets detected',
+                    fontsize=16, fontweight='bold', y=1.02)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"\nHistograms saved to: {save_path}")
+        else:
+            plt.show()
+
+        # Print summary statistics
+        print("\n" + "="*60)
+        print("DROPLET STREAK STATISTICS")
+        print("="*60)
+        print(f"Total droplets analyzed: {total_droplets}")
+        print(f"Mean streak length: {mean_length:.2f} ± {std_length:.2f} pixels")
+        print(f"Mean streak width: {mean_width:.2f} ± {std_width:.2f} pixels")
+        print(f"Length/Width aspect ratio: {mean_length/mean_width:.2f}")
+        print("="*60)
 
 
 def main():
@@ -1192,10 +1391,18 @@ if __name__ == '__main__':
     results = analyzer.calculate_statistics()
     analyzer.print_results(results)
 
-    # Plot the first analyzed frame with annotations
+    # Plot the first analyzed frame with annotations (shows length/width lines)
     analyzer.plot_first_frame()
     # Or save to file instead:
     # analyzer.plot_first_frame(save_path='first_frame_annotated.png')
+
+    # Create histograms showing droplet count, length, and width distributions
+    analyzer.plot_histograms()
+    # Or save to file instead:
+    # analyzer.plot_histograms(save_path='droplet_histograms.png')
+
+    # Save per-droplet data to numpy binary file
+    analyzer.save_droplet_data_numpy('droplet_data.npy')
 
     # Optionally save results to JSON
     # analyzer.save_results('test_results.json')
