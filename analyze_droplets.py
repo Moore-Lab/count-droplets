@@ -96,7 +96,7 @@ class DropletAnalyzer:
         """
         print("\nOpening interactive frame viewer...")
         print("Instructions:")
-        print("  - Click and drag on the image to define a new ROI")
+        print("  - Click 'Select ROI' button, then click and drag on the image to define a new ROI")
         print("  - Or enter exact pixel coordinates in the text boxes and press Enter")
         print("  - Adjust detection parameters (Threshold, Min area, Max area) and press Enter")
         print("  - Adjust start/end times for analysis")
@@ -104,6 +104,7 @@ class DropletAnalyzer:
         print("  - Click 'Show Droplets' to preview detection (green circles)")
         print("  - Click 'Show Sum View' to see persistence view (burn-in effect)")
         print("  - Toggle 'Analysis Only' / 'Entire Video' to control what is summed")
+        print("  - Click 'Show Processed' to see preprocessed binary image (CLAHE, blur, threshold, morphology)")
         print("  - Click 'Run Analysis' button or close the window to start analysis")
 
         # Calculate analysis frame range from current time settings
@@ -119,12 +120,14 @@ class DropletAnalyzer:
             'end_frame': end_frame,      # Full video range for viewing
             'analysis_start_frame': analysis_start_frame,  # Analysis range
             'analysis_end_frame': analysis_end_frame,      # Analysis range
+            'roi_selection_mode': False,  # Toggle for ROI selection mode
             'drawing': False,
             'start_x': None,
             'start_y': None,
             'temp_rect': None,
             'show_droplets': False,  # Toggle for showing droplet detection
             'show_sum_view': False,  # Toggle for showing sum of all frames
+            'show_processed': False,  # Toggle for showing processed image (CLAHE, blur, threshold, morphology)
             'sum_analysis_only': True,  # True = sum only analysis window, False = sum entire video
             'sum_frame_cache': None,  # Cache for the summed frame
             'sum_frame_cache_full': None,  # Cache for full video sum
@@ -231,8 +234,34 @@ class DropletAnalyzer:
             viewer_state['current_frame'] = max(viewer_state['start_frame'],
                                                  min(frame_idx, viewer_state['end_frame'] - 1))
 
+            # Read the current frame first (needed for all modes)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, viewer_state['current_frame'])
+            ret, frame = self.cap.read()
+
+            if not ret:
+                print(f"Could not read frame {viewer_state['current_frame']}")
+                return
+
+            # Check if we should show processed view
+            if viewer_state['show_processed']:
+                # Get the processed binary image
+                _, _, processed_binary = self.detect_droplets(
+                    frame,
+                    viewer_state['threshold'],
+                    viewer_state['min_area'],
+                    viewer_state['max_area'],
+                    return_processed=True
+                )
+
+                # Create a full-frame black image and place the processed ROI
+                full_processed = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
+                full_processed[self.y_start:self.y_stop, self.x_start:self.x_stop] = processed_binary
+
+                # Convert to RGB for display (will show white droplets on black background)
+                frame_rgb = cv2.cvtColor(full_processed, cv2.COLOR_GRAY2RGB)
+
             # Check if we should show sum view
-            if viewer_state['show_sum_view']:
+            elif viewer_state['show_sum_view']:
                 # Use appropriate cache based on mode
                 if viewer_state['sum_analysis_only']:
                     if viewer_state['sum_frame_cache'] is None:
@@ -253,14 +282,6 @@ class DropletAnalyzer:
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             else:
-                # Read the current frame
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, viewer_state['current_frame'])
-                ret, frame = self.cap.read()
-
-                if not ret:
-                    print(f"Could not read frame {viewer_state['current_frame']}")
-                    return
-
                 # Convert BGR to RGB for matplotlib
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -304,6 +325,7 @@ class DropletAnalyzer:
                     ax.add_patch(circle)
 
                     # Draw length line (major axis) - red
+                    # The stored angle now always corresponds to the length/motion direction
                     angle_rad = np.deg2rad(angle)
                     length_dx = (length / 2) * np.cos(angle_rad)
                     length_dy = (length / 2) * np.sin(angle_rad)
@@ -312,6 +334,7 @@ class DropletAnalyzer:
                            'r-', linewidth=1, alpha=0.8)
 
                     # Draw width line (minor axis) - blue
+                    # Width is perpendicular to the length/motion direction
                     width_angle_rad = angle_rad + np.pi/2
                     width_dx = (width / 2) * np.cos(width_angle_rad)
                     width_dy = (width / 2) * np.sin(width_angle_rad)
@@ -324,23 +347,33 @@ class DropletAnalyzer:
             # Calculate time and create title
             total_frames_in_video = viewer_state['end_frame'] - viewer_state['start_frame']
             analysis_frames = viewer_state['analysis_end_frame'] - viewer_state['analysis_start_frame']
-            if viewer_state['show_sum_view']:
+            if viewer_state['show_processed']:
+                # Show processed view info
+                time_sec = viewer_state['current_frame'] / self.fps
+                frame_in_video = viewer_state['current_frame'] - viewer_state['start_frame'] + 1
+                detection_status = f" | Droplets: {droplet_count}{density_str}" if viewer_state['show_droplets'] else ""
+                ax.set_title(f"PROCESSED VIEW (CLAHE→Blur→Threshold→Morphology)\n"
+                            f"Frame: {frame_in_video}/{total_frames_in_video} | Time: {time_sec:.2f}s{detection_status}",
+                            fontsize=14, fontweight='bold')
+            elif viewer_state['show_sum_view']:
                 # Show sum view info
                 detection_status = f" | Droplets: {droplet_count}{density_str}" if viewer_state['show_droplets'] else ""
                 if viewer_state['sum_analysis_only']:
                     mode_str = f"Analysis Window Only - {analysis_frames} frames"
                 else:
                     mode_str = f"Entire Video - {total_frames_in_video} frames"
+                roi_instruction = "Click and drag to define ROI" if viewer_state['roi_selection_mode'] else "Click 'Select ROI' button to adjust ROI"
                 ax.set_title(f"PERSISTENCE VIEW ({mode_str}){detection_status}\n"
-                            f"Click and drag to adjust ROI",
+                            f"{roi_instruction}",
                             fontsize=14, fontweight='bold')
             else:
                 # Show regular frame info
                 time_sec = viewer_state['current_frame'] / self.fps
                 frame_in_video = viewer_state['current_frame'] - viewer_state['start_frame'] + 1
                 detection_status = f" | Droplets: {droplet_count}{density_str}" if viewer_state['show_droplets'] else ""
+                roi_instruction = "Click and drag to define ROI" if viewer_state['roi_selection_mode'] else "Click 'Select ROI' button to adjust ROI"
                 ax.set_title(f"Frame: {frame_in_video}/{total_frames_in_video} | Time: {time_sec:.2f}s{detection_status}\n"
-                            f"Click and drag to adjust ROI",
+                            f"{roi_instruction}",
                             fontsize=14, fontweight='bold')
             ax.set_xlabel(f"X pixels", fontsize=10)
             ax.set_ylabel(f"Y pixels", fontsize=10)
@@ -398,24 +431,28 @@ class DropletAnalyzer:
         textbox_max_area = TextBox(ax_max_area, 'Max area:', initial=str(max_area))
 
         # Create time input boxes and buttons (bottom row)
+        ax_roi_button = plt.axes([0.02, 0.02, 0.09, 0.035])
         ax_start_time = plt.axes([0.15, 0.02, 0.10, 0.035])
         ax_end_time = plt.axes([0.27, 0.02, 0.10, 0.035])
         ax_toggle_button = plt.axes([0.38, 0.02, 0.09, 0.035])
         ax_sum_view_button = plt.axes([0.48, 0.02, 0.09, 0.035])
         ax_sum_mode_button = plt.axes([0.58, 0.02, 0.09, 0.035])
+        ax_processed_button = plt.axes([0.78, 0.02, 0.10, 0.035])
         ax_run_button = plt.axes([0.68, 0.02, 0.09, 0.035])
 
+        btn_select_roi = Button(ax_roi_button, 'Select ROI')
         textbox_start_time = TextBox(ax_start_time, 'Start (s):', initial=f"{self.start_time:.1f}")
         textbox_end_time = TextBox(ax_end_time, 'End (s):', initial=f"{self.end_time:.1f}")
         btn_toggle_droplets = Button(ax_toggle_button, 'Show Droplets')
         btn_sum_view = Button(ax_sum_view_button, 'Show Sum View')
         btn_sum_mode = Button(ax_sum_mode_button, 'Analysis Only')
+        btn_processed = Button(ax_processed_button, 'Show Processed')
         btn_run_analysis = Button(ax_run_button, 'Run Analysis')
 
         # Mouse event handlers for ROI selection
         def on_mouse_press(event):
             """Handle mouse button press."""
-            if event.inaxes != ax:
+            if event.inaxes != ax or not viewer_state['roi_selection_mode']:
                 return
             viewer_state['drawing'] = True
             viewer_state['start_x'] = int(event.xdata)
@@ -486,6 +523,11 @@ class DropletAnalyzer:
 
             # Invalidate analysis-only cache since ROI changed
             viewer_state['sum_frame_cache'] = None
+
+            # Turn off ROI selection mode after successful selection
+            viewer_state['roi_selection_mode'] = False
+            btn_select_roi.label.set_text('Select ROI')
+            print("ROI selection mode: DISABLED")
 
             # Clear temporary rectangle and redraw
             viewer_state['temp_rect'] = None
@@ -673,14 +715,42 @@ class DropletAnalyzer:
                 textbox_max_area.set_val(str(viewer_state['max_area']))
 
         def toggle_droplets_callback(_):
+            # Toggle droplets state
             viewer_state['show_droplets'] = not viewer_state['show_droplets']
+
+            # If turning on droplets, turn off other layers
+            if viewer_state['show_droplets']:
+                if viewer_state['show_sum_view']:
+                    viewer_state['show_sum_view'] = False
+                    btn_sum_view.label.set_text('Show Sum View')
+                    print("Sum view turned off")
+                if viewer_state['show_processed']:
+                    viewer_state['show_processed'] = False
+                    btn_processed.label.set_text('Show Processed')
+                    print("Processed view turned off")
+
+            # Update button and status
             status = "ON" if viewer_state['show_droplets'] else "OFF"
             btn_toggle_droplets.label.set_text('Hide Droplets' if viewer_state['show_droplets'] else 'Show Droplets')
             print(f"Droplet detection display: {status}")
             show_frame(viewer_state['current_frame'])
 
         def toggle_sum_view_callback(_):
+            # Toggle sum view state
             viewer_state['show_sum_view'] = not viewer_state['show_sum_view']
+
+            # If turning on sum view, turn off other layers
+            if viewer_state['show_sum_view']:
+                if viewer_state['show_droplets']:
+                    viewer_state['show_droplets'] = False
+                    btn_toggle_droplets.label.set_text('Show Droplets')
+                    print("Droplet detection turned off")
+                if viewer_state['show_processed']:
+                    viewer_state['show_processed'] = False
+                    btn_processed.label.set_text('Show Processed')
+                    print("Processed view turned off")
+
+            # Update button and status
             status = "ON" if viewer_state['show_sum_view'] else "OFF"
             btn_sum_view.label.set_text('Hide Sum View' if viewer_state['show_sum_view'] else 'Show Sum View')
             print(f"Sum view display: {status}")
@@ -695,6 +765,42 @@ class DropletAnalyzer:
             # Refresh if sum view is currently active
             if viewer_state['show_sum_view']:
                 show_frame(viewer_state['current_frame'])
+
+        def toggle_processed_callback(_):
+            # Toggle processed view state
+            viewer_state['show_processed'] = not viewer_state['show_processed']
+
+            # If turning on processed view, turn off other layers
+            if viewer_state['show_processed']:
+                if viewer_state['show_droplets']:
+                    viewer_state['show_droplets'] = False
+                    btn_toggle_droplets.label.set_text('Show Droplets')
+                    print("Droplet detection turned off")
+                if viewer_state['show_sum_view']:
+                    viewer_state['show_sum_view'] = False
+                    btn_sum_view.label.set_text('Show Sum View')
+                    print("Sum view turned off")
+
+            # Update button and status
+            status = "ON" if viewer_state['show_processed'] else "OFF"
+            btn_processed.label.set_text('Hide Processed' if viewer_state['show_processed'] else 'Show Processed')
+            print(f"Processed view display: {status}")
+            show_frame(viewer_state['current_frame'])
+
+        def select_roi_callback(_):
+            # Toggle ROI selection mode
+            viewer_state['roi_selection_mode'] = not viewer_state['roi_selection_mode']
+
+            # Update button label
+            if viewer_state['roi_selection_mode']:
+                btn_select_roi.label.set_text('Cancel ROI')
+                print("ROI selection mode: ENABLED - Click and drag on image to define new ROI")
+            else:
+                btn_select_roi.label.set_text('Select ROI')
+                print("ROI selection mode: DISABLED")
+
+            # Refresh to update title
+            show_frame(viewer_state['current_frame'])
 
         def run_analysis_callback(_):
             print("\n'Run Analysis' button clicked!")
@@ -721,9 +827,11 @@ class DropletAnalyzer:
 
         textbox_start_time.on_submit(update_start_time)
         textbox_end_time.on_submit(update_end_time)
+        btn_select_roi.on_clicked(select_roi_callback)
         btn_toggle_droplets.on_clicked(toggle_droplets_callback)
         btn_sum_view.on_clicked(toggle_sum_view_callback)
         btn_sum_mode.on_clicked(toggle_sum_mode_callback)
+        btn_processed.on_clicked(toggle_processed_callback)
         btn_run_analysis.on_clicked(run_analysis_callback)
 
         # Show initial frame
@@ -740,20 +848,31 @@ class DropletAnalyzer:
         # Return adjusted detection parameters
         return viewer_state['threshold'], viewer_state['min_area'], viewer_state['max_area']
 
-    def detect_droplets(self, frame, threshold=50, min_area=10, max_area=100):
+    def detect_droplets(self, frame, threshold=50, min_area=10, max_area=100, return_processed=False):
         """
-        Detect droplets in a frame using blob detection.
+        Detect droplets in a frame using enhanced blob detection.
         Measures streak length and width for each droplet.
+
+        Uses preprocessing steps to improve detection:
+        1. CLAHE (Contrast Limited Adaptive Histogram Equalization) for contrast enhancement
+        2. Gaussian blur for noise reduction
+        3. Binary thresholding
+        4. Morphological operations (opening and closing) to clean up binary image
 
         Args:
             frame: Input frame (BGR format)
             threshold: Brightness threshold for droplet detection
             min_area: Minimum droplet area in pixels
             max_area: Maximum droplet area in pixels
+            return_processed: If True, also return the processed binary image
 
         Returns:
-            Tuple of (count, droplet_data) where droplet_data is a list of dicts containing
-            droplet information: x, y, radius, length, width, angle
+            If return_processed is False:
+                Tuple of (count, droplet_data) where droplet_data is a list of dicts containing
+                droplet information: x, y, radius, length, width, angle
+            If return_processed is True:
+                Tuple of (count, droplet_data, processed_image) where processed_image is the
+                final binary image after all preprocessing steps
         """
         # Extract the region of interest
         roi = frame[self.y_start:self.y_stop, self.x_start:self.x_stop]
@@ -761,8 +880,24 @@ class DropletAnalyzer:
         # Convert to grayscale
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # This enhances local contrast, making dim droplets more visible
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Apply Gaussian blur to reduce noise
+        # Kernel size (3,3) is small to preserve droplet edges
+        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
         # Apply threshold to find bright spots
-        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+
+        # Optional morphological operations to clean up the binary image
+        # Using a 3x3 kernel with 1 iteration of closing to connect pixels that are 1 pixel apart
+        # This connects white pixels separated by 1 black pixel (diagonal or orthogonal)
+        # Opening is removed to avoid eroding away small droplets
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         # Find contours (droplets)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -773,7 +908,7 @@ class DropletAnalyzer:
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if min_area <= area <= max_area and len(contour) >= 5:  # Need at least 5 points for minAreaRect
+            if min_area <= area <= max_area:
                 valid_droplets += 1
 
                 # Calculate centroid
@@ -785,16 +920,38 @@ class DropletAnalyzer:
                     # Calculate equivalent radius
                     radius = int(np.sqrt(area / np.pi))
 
-                    # Get minimum area rectangle to measure streak length and width
-                    rect = cv2.minAreaRect(contour)
-                    # rect = ((center_x, center_y), (width, height), angle)
-                    # width and height are the dimensions of the rotated rectangle
-                    # The longer dimension is the streak length, shorter is width
-                    (rect_cx, rect_cy), (rect_w, rect_h), angle = rect
+                    # Measure streak length and width
+                    # For contours with >= 5 points, use minAreaRect for accurate measurement
+                    # For smaller contours, use bounding box as fallback
+                    if len(contour) >= 5:
+                        # Get minimum area rectangle to measure streak length and width
+                        rect = cv2.minAreaRect(contour)
+                        # rect = ((center_x, center_y), (width, height), angle)
+                        # width and height are the dimensions of the rotated rectangle
+                        # The angle is the rotation of the rectangle from horizontal
+                        (_, _), (rect_w, rect_h), angle = rect
 
-                    # Length is the longer dimension, width is the shorter
-                    length = max(rect_w, rect_h)
-                    width = min(rect_w, rect_h)
+                        # Determine which dimension is the length and adjust angle accordingly
+                        # The angle from minAreaRect corresponds to rect_w's direction
+                        # We need the angle to always correspond to the length direction
+                        if rect_w >= rect_h:
+                            # rect_w is the length (motion direction)
+                            length = rect_w
+                            width = rect_h
+                            length_angle = angle  # angle already corresponds to length
+                        else:
+                            # rect_h is the length (motion direction)
+                            length = rect_h
+                            width = rect_w
+                            length_angle = angle + 90  # rotate 90° to get length direction
+
+                        angle = length_angle  # Store angle of length/motion direction
+                    else:
+                        # Fallback for small contours: use simple bounding box
+                        _, _, w_bound, h_bound = cv2.boundingRect(contour)
+                        length = max(w_bound, h_bound)
+                        width = min(w_bound, h_bound)
+                        angle = 0.0  # No rotation info for simple bounding box
 
                     # Store location in absolute frame coordinates
                     abs_x = cx + self.x_start
@@ -810,7 +967,10 @@ class DropletAnalyzer:
                     }
                     droplet_data.append(droplet_info)
 
-        return valid_droplets, droplet_data
+        if return_processed:
+            return valid_droplets, droplet_data, binary
+        else:
+            return valid_droplets, droplet_data
 
     def analyze(self, threshold=50, min_area=10, max_area=100, show_progress=True, view_frames=False):
         """
@@ -960,6 +1120,7 @@ class DropletAnalyzer:
             ax.add_patch(circle)
 
             # Draw length line (major axis)
+            # The stored angle now always corresponds to the length/motion direction
             angle_rad = np.deg2rad(angle)
             length_dx = (length / 2) * np.cos(angle_rad)
             length_dy = (length / 2) * np.sin(angle_rad)
@@ -968,6 +1129,7 @@ class DropletAnalyzer:
                    'r-', linewidth=1.5, alpha=0.7)
 
             # Draw width line (minor axis, perpendicular to length)
+            # Width is perpendicular to the length/motion direction
             width_angle_rad = angle_rad + np.pi/2
             width_dx = (width / 2) * np.cos(width_angle_rad)
             width_dy = (width / 2) * np.sin(width_angle_rad)
@@ -1054,11 +1216,16 @@ class DropletAnalyzer:
 
     def print_results(self, results):
         """Print analysis results."""
+        # Conversion factor: pixels per micron
+        pixels_per_um = 0.1878
+        roi_area_um2 = results['roi_area_pixels'] / (pixels_per_um ** 2)
+
         print("\n" + "="*60)
         print("DROPLET ANALYSIS RESULTS")
         print("="*60)
         print(f"Frames analyzed: {results['frames_analyzed']}")
         print(f"Analysis region area: {results['roi_area_pixels']:,} pixels")
+        print(f"                      ({roi_area_um2:,.0f} μm²)")
         print()
         print(f"Mean droplet count per frame: {results['mean_droplet_count']:.2f}")
         print(f"Std deviation of count: {results['std_droplet_count']:.2f}")
@@ -1066,7 +1233,9 @@ class DropletAnalyzer:
         print(f"Max droplet count: {results['max_droplet_count']}")
         print()
         print(f"Mean density: {results['mean_density_per_1000px']:.4f} droplets per 1000 px²")
-        print(f"Std density: {results['std_density_per_1000px']:.4f} droplets per 1000 px²")
+        print(f"              ({results['mean_density_per_1000px'] * 1000 / (pixels_per_um ** 2):.4f} droplets per 1000 μm²)")
+        print(f"Std density:  {results['std_density_per_1000px']:.4f} droplets per 1000 px²")
+        print(f"              ({results['std_density_per_1000px'] * 1000 / (pixels_per_um ** 2):.4f} droplets per 1000 μm²)")
         print("="*60)
 
     def save_results(self, output_path):
@@ -1170,24 +1339,28 @@ class DropletAnalyzer:
         # Calculate ROI area for density
         roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
 
+        # Conversion factor: pixels per micron
+        pixels_per_um = 0.1878
+        roi_area_um2 = roi_area / (pixels_per_um ** 2)
+
         # Create figure with 3 subplots
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
-        # Histogram 1: Droplet count per frame with density twin axis
-        ax1_twin = ax1.twinx()
-
-        _, bins1, _ = ax1.hist(counts, bins=30, alpha=0.7, color='blue', edgecolor='black')
+        # Histogram 1: Droplet count per frame with density twin x-axis
+        # Create bins with width 1 for count histogram
+        count_bins = np.arange(min(counts), max(counts) + 2, 1) if counts else [0, 1]
+        ax1.hist(counts, bins=count_bins, alpha=0.7, color='blue', edgecolor='black')
         ax1.set_xlabel('Droplet Count per Frame', fontsize=12)
-        ax1.set_ylabel('Frequency (Number of Frames)', fontsize=12, color='blue')
-        ax1.tick_params(axis='y', labelcolor='blue')
+        ax1.set_ylabel('Frequency (Number of Frames)', fontsize=12)
         ax1.set_title('Droplet Count Distribution', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
 
-        # Twin axis for density
-        densities = np.array(counts) / roi_area
-        ax1_twin.hist(densities, bins=bins1, alpha=0.3, color='red', edgecolor='black')
-        ax1_twin.set_ylabel('Density (droplets/px²)', fontsize=12, color='red')
-        ax1_twin.tick_params(axis='y', labelcolor='red')
+        # Twin x-axis for density in droplets/μm²
+        ax1_twin = ax1.twiny()
+        ax1_xlim = ax1.get_xlim()
+        ax1_twin.set_xlim(ax1_xlim[0] / roi_area_um2, ax1_xlim[1] / roi_area_um2)
+        ax1_twin.set_xlabel('Density (droplets/μm²)', fontsize=12, color='blue')
+        ax1_twin.tick_params(axis='x', labelcolor='blue')
 
         # Add statistics to plot
         mean_count = np.mean(counts)
@@ -1196,12 +1369,23 @@ class DropletAnalyzer:
                    label=f'Mean: {mean_count:.1f} ± {std_count:.1f}')
         ax1.legend(fontsize=10)
 
-        # Histogram 2: Streak length
-        ax2.hist(lengths, bins=40, alpha=0.7, color='green', edgecolor='black')
+        # Histogram 2: Streak length with velocity twin x-axis
+        # Create bins with width 1 for length histogram
+        length_bins = np.arange(int(min(lengths)), int(max(lengths)) + 2, 1) if lengths else [0, 1]
+        ax2.hist(lengths, bins=length_bins, alpha=0.7, color='green', edgecolor='black')
         ax2.set_xlabel('Streak Length (pixels)', fontsize=12)
         ax2.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
         ax2.set_title('Streak Length Distribution', fontsize=14, fontweight='bold')
         ax2.grid(True, alpha=0.3)
+
+        # Twin x-axis for velocity in μm/s
+        # Velocity = (length in μm) × frame_rate = (length in pixels / pixels_per_um) × fps
+        ax2_twin = ax2.twiny()
+        velocity_factor = self.fps / pixels_per_um
+        ax2_xlim = ax2.get_xlim()
+        ax2_twin.set_xlim(ax2_xlim[0] * velocity_factor, ax2_xlim[1] * velocity_factor)
+        ax2_twin.set_xlabel('Velocity (μm/s)', fontsize=12, color='darkgreen')
+        ax2_twin.tick_params(axis='x', labelcolor='darkgreen')
 
         # Add statistics
         mean_length = np.mean(lengths)
@@ -1210,12 +1394,21 @@ class DropletAnalyzer:
                    label=f'Mean: {mean_length:.2f} ± {std_length:.2f} px')
         ax2.legend(fontsize=10)
 
-        # Histogram 3: Streak width
-        ax3.hist(widths, bins=40, alpha=0.7, color='orange', edgecolor='black')
+        # Histogram 3: Streak width with μm twin x-axis
+        # Create bins with width 1 for width histogram
+        width_bins = np.arange(int(min(widths)), int(max(widths)) + 2, 1) if widths else [0, 1]
+        ax3.hist(widths, bins=width_bins, alpha=0.7, color='orange', edgecolor='black')
         ax3.set_xlabel('Streak Width at Midpoint (pixels)', fontsize=12)
         ax3.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
         ax3.set_title('Streak Width Distribution', fontsize=14, fontweight='bold')
         ax3.grid(True, alpha=0.3)
+
+        # Twin x-axis for width in μm
+        ax3_twin = ax3.twiny()
+        ax3_xlim = ax3.get_xlim()
+        ax3_twin.set_xlim(ax3_xlim[0] / pixels_per_um, ax3_xlim[1] / pixels_per_um)
+        ax3_twin.set_xlabel('Width (μm)', fontsize=12, color='darkorange')
+        ax3_twin.tick_params(axis='x', labelcolor='darkorange')
 
         # Add statistics
         mean_width = np.mean(widths)
@@ -1243,9 +1436,18 @@ class DropletAnalyzer:
         print("DROPLET STREAK STATISTICS")
         print("="*60)
         print(f"Total droplets analyzed: {total_droplets}")
-        print(f"Mean streak length: {mean_length:.2f} ± {std_length:.2f} pixels")
-        print(f"Mean streak width: {mean_width:.2f} ± {std_width:.2f} pixels")
-        print(f"Length/Width aspect ratio: {mean_length/mean_width:.2f}")
+        print(f"\nStreak measurements:")
+        print(f"  Mean length: {mean_length:.2f} ± {std_length:.2f} pixels")
+        print(f"              ({mean_length/pixels_per_um:.2f} ± {std_length/pixels_per_um:.2f} μm)")
+        print(f"  Mean width:  {mean_width:.2f} ± {std_width:.2f} pixels")
+        print(f"              ({mean_width/pixels_per_um:.2f} ± {std_width/pixels_per_um:.2f} μm)")
+        print(f"  Aspect ratio: {mean_length/mean_width:.2f}")
+        print(f"\nVelocity (assuming streak length = distance per frame):")
+        mean_velocity = (mean_length / pixels_per_um) * self.fps
+        std_velocity = (std_length / pixels_per_um) * self.fps
+        print(f"  Mean velocity: {mean_velocity:.2f} ± {std_velocity:.2f} μm/s")
+        print(f"\nSpatial calibration: {pixels_per_um:.4f} pixels/μm")
+        print(f"Temporal resolution: {self.fps:.2f} fps")
         print("="*60)
 
 
