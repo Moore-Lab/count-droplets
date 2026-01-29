@@ -12,6 +12,201 @@ from pathlib import Path
 import json
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, TextBox
+from scipy import stats
+from scipy.optimize import curve_fit
+from scipy.constants import k as kB
+
+
+# =============================================================================
+# Thermal velocity distribution with dwell-time detection bias
+# =============================================================================
+
+def dwell_weight(vr, w0, t_max=None):
+    """
+    Intensity-weighted dwell time for a straight-line trajectory
+    through a collimated Gaussian beam.
+
+    For collimated beam: w(z) = w0
+    Weight ∝ ∫ exp(-2 r(t)^2 / w0^2) dt ∝ 1 / |vr|
+
+    Parameters
+    ----------
+    vr : array_like
+        Radial (transverse) velocity magnitude
+    w0 : float
+        Beam waist (same units as vr * time)
+    t_max : float or None
+        Maximum effective interaction time (regularization)
+
+    Returns
+    -------
+    weight : array_like
+        Dwell-time weight for each particle
+    """
+    if t_max is not None:
+        # Physical regularization: cap dwell time at t_max
+        tau = w0 / np.maximum(vr, w0 / t_max)
+    else:
+        # Simple regularization to avoid divergence at vr=0
+        eps = 1e-6 * np.max(vr) if len(vr) > 0 else 1e-6
+        tau = 1.0 / np.sqrt(vr**2 + eps**2)
+    return tau
+
+
+def observed_speed_pdf_mc(u_bins, T, m, w0, t_max=None, N_mc=500_000):
+    """
+    Monte Carlo forward model for the observed in-plane speed PDF,
+    accounting for dwell-time detection bias.
+
+    Parameters
+    ----------
+    u_bins : array_like
+        Speed bin edges (m/s)
+    T : float
+        Temperature (K)
+    m : float
+        Droplet mass (kg)
+    w0 : float
+        Beam waist (m)
+    t_max : float or None
+        Maximum effective interaction time (s)
+    N_mc : int
+        Number of Monte Carlo samples
+
+    Returns
+    -------
+    centers : array_like
+        Bin centers
+    pdf : array_like
+        Normalized observed PDF
+    """
+    # Thermal velocity spread
+    sigma = np.sqrt(kB * T / m)
+
+    # Sample 3D Maxwell-Boltzmann velocities
+    vx = np.random.normal(0, sigma, N_mc)
+    vy = np.random.normal(0, sigma, N_mc)
+    vz = np.random.normal(0, sigma, N_mc)
+
+    # Cylindrical transverse velocity (perpendicular to beam axis)
+    vr = np.sqrt(vx**2 + vy**2)
+
+    # In-plane speed (what the camera sees)
+    u = np.sqrt(vr**2 + vz**2)
+
+    # Detection weighting (dwell-time bias)
+    W = dwell_weight(vr, w0, t_max=t_max)
+
+    # Histogram with weights
+    hist, edges = np.histogram(u, bins=u_bins, weights=W, density=False)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    # Normalize to PDF
+    total = np.trapz(hist, centers)
+    pdf = hist / total if total > 0 else hist
+
+    return centers, pdf
+
+
+def approx_observed_pdf(u, T, m):
+    """
+    Leading-order analytic approximation for observed speed PDF.
+
+    The Rayleigh prefactor is approximately canceled by the dwell-time bias,
+    leaving: f_obs(u) ∝ exp(-m u² / (2 k_B T))
+
+    Parameters
+    ----------
+    u : array_like
+        Speed values (m/s)
+    T : float
+        Temperature (K)
+    m : float
+        Droplet mass (kg)
+
+    Returns
+    -------
+    pdf : array_like
+        Normalized PDF values
+    """
+    a = m / (2 * kB * T)
+    pdf = np.exp(-a * u**2)
+    # Normalize
+    total = np.trapz(pdf, u)
+    return pdf / total if total > 0 else pdf
+
+
+def fit_temperature_from_speed(u_data, counts, m, w0=None, use_mc=False, N_mc=200_000):
+    """
+    Fit effective temperature from observed speed distribution.
+
+    Parameters
+    ----------
+    u_data : array_like
+        Speed bin centers (m/s)
+    counts : array_like
+        Histogram counts (will be normalized)
+    m : float
+        Droplet mass (kg)
+    w0 : float or None
+        Beam waist (m), required if use_mc=True
+    use_mc : bool
+        If True, use full Monte Carlo model; if False, use analytic approximation
+    N_mc : int
+        Number of Monte Carlo samples (if use_mc=True)
+
+    Returns
+    -------
+    T_fit : float
+        Fitted temperature (K)
+    T_err : float
+        Temperature uncertainty (K)
+    """
+    u_data = np.asarray(u_data)
+    counts = np.asarray(counts, dtype=float)
+
+    # Normalize to PDF
+    total = np.trapz(counts, u_data)
+    pdf_data = counts / total if total > 0 else counts
+
+    if not use_mc:
+        # Analytic approximation fit
+        def model(u, T):
+            return approx_observed_pdf(u, T, m)
+
+        try:
+            popt, pcov = curve_fit(model, u_data, pdf_data, p0=[300.0],
+                                   bounds=(1.0, 1e6), maxfev=5000)
+            T_fit = popt[0]
+            T_err = np.sqrt(np.diag(pcov))[0]
+        except Exception as e:
+            print(f"Temperature fit failed: {e}")
+            T_fit, T_err = np.nan, np.nan
+
+        return T_fit, T_err
+
+    else:
+        # Full Monte Carlo fit (slower but more accurate)
+        if w0 is None:
+            raise ValueError("w0 (beam waist) required for Monte Carlo fit")
+
+        u_bins = np.concatenate([u_data - 0.5 * (u_data[1] - u_data[0]),
+                                  [u_data[-1] + 0.5 * (u_data[1] - u_data[0])]])
+
+        def model(u, T):
+            _, pdf = observed_speed_pdf_mc(u_bins, T, m, w0, N_mc=N_mc)
+            return pdf
+
+        try:
+            popt, pcov = curve_fit(model, u_data, pdf_data, p0=[300.0],
+                                   bounds=(1.0, 1e6), maxfev=100)
+            T_fit = popt[0]
+            T_err = np.sqrt(np.diag(pcov))[0]
+        except Exception as e:
+            print(f"Temperature fit (MC) failed: {e}")
+            T_fit, T_err = np.nan, np.nan
+
+        return T_fit, T_err
 
 
 class DropletAnalyzer:
@@ -308,9 +503,11 @@ class DropletAnalyzer:
                 )
                 droplet_count = count
 
-                # Calculate density
-                roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
-                density = droplet_count / roi_area
+                # Calculate density using beam cross-sectional area
+                # Laser beam passes horizontally (right to left), so vertical ROI height = beam diameter
+                beam_radius_px = (self.y_stop - self.y_start) / 2
+                beam_cross_section = np.pi * beam_radius_px**2
+                density = droplet_count / beam_cross_section
 
                 # Draw circles around detected droplets with length/width lines
                 for droplet in droplet_data:
@@ -853,6 +1050,10 @@ class DropletAnalyzer:
         Detect droplets in a frame using enhanced blob detection.
         Measures streak length and width for each droplet.
 
+        Processes the ENTIRE frame (not just the spatial ROI) so that density
+        can be normalized by either the spatial ROI or the effective full-frame area.
+        Each droplet is tagged with 'in_roi' to indicate if it falls within the spatial ROI.
+
         Uses preprocessing steps to improve detection:
         1. CLAHE (Contrast Limited Adaptive Histogram Equalization) for contrast enhancement
         2. Gaussian blur for noise reduction
@@ -869,16 +1070,14 @@ class DropletAnalyzer:
         Returns:
             If return_processed is False:
                 Tuple of (count, droplet_data) where droplet_data is a list of dicts containing
-                droplet information: x, y, radius, length, width, angle
+                droplet information: x, y, radius, length, width, angle, in_roi
             If return_processed is True:
                 Tuple of (count, droplet_data, processed_image) where processed_image is the
                 final binary image after all preprocessing steps
         """
-        # Extract the region of interest
-        roi = frame[self.y_start:self.y_stop, self.x_start:self.x_stop]
-
+        # Process the ENTIRE frame (not just ROI)
         # Convert to grayscale
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
         # This enhances local contrast, making dim droplets more visible
@@ -911,7 +1110,7 @@ class DropletAnalyzer:
             if min_area <= area <= max_area:
                 valid_droplets += 1
 
-                # Calculate centroid
+                # Calculate centroid (already in absolute frame coordinates since we process full frame)
                 M = cv2.moments(contour)
                 if M['m00'] != 0:
                     cx = int(M['m10'] / M['m00'])
@@ -929,7 +1128,7 @@ class DropletAnalyzer:
                         # rect = ((center_x, center_y), (width, height), angle)
                         # width and height are the dimensions of the rotated rectangle
                         # The angle is the rotation of the rectangle from horizontal
-                        (_, _), (rect_w, rect_h), angle = rect
+                        (rect_cx, rect_cy), (rect_w, rect_h), angle = rect
 
                         # Determine which dimension is the length and adjust angle accordingly
                         # The angle from minAreaRect corresponds to rect_w's direction
@@ -946,6 +1145,26 @@ class DropletAnalyzer:
                             length_angle = angle + 90  # rotate 90° to get length direction
 
                         angle = length_angle  # Store angle of length/motion direction
+
+                        # Compute endpoint coordinates for length and width axes
+                        # Length axis: along the motion direction (angle)
+                        angle_rad = np.deg2rad(angle)
+                        half_len = length / 2.0
+                        half_wid = width / 2.0
+
+                        # Length endpoints (start = tail, end = head of motion)
+                        len_dx = half_len * np.cos(angle_rad)
+                        len_dy = half_len * np.sin(angle_rad)
+                        length_start = (rect_cx - len_dx, rect_cy - len_dy)  # tail
+                        length_end = (rect_cx + len_dx, rect_cy + len_dy)    # head
+
+                        # Width endpoints (perpendicular to length)
+                        wid_angle_rad = angle_rad + np.pi / 2
+                        wid_dx = half_wid * np.cos(wid_angle_rad)
+                        wid_dy = half_wid * np.sin(wid_angle_rad)
+                        width_start = (rect_cx - wid_dx, rect_cy - wid_dy)
+                        width_end = (rect_cx + wid_dx, rect_cy + wid_dy)
+
                     else:
                         # Fallback for small contours: use simple bounding box
                         _, _, w_bound, h_bound = cv2.boundingRect(contour)
@@ -953,17 +1172,37 @@ class DropletAnalyzer:
                         width = min(w_bound, h_bound)
                         angle = 0.0  # No rotation info for simple bounding box
 
-                    # Store location in absolute frame coordinates
-                    abs_x = cx + self.x_start
-                    abs_y = cy + self.y_start
+                        # For bounding box, use center-aligned endpoints
+                        rect_cx, rect_cy = cx, cy
+                        if w_bound >= h_bound:
+                            # Horizontal orientation
+                            length_start = (rect_cx - length/2, rect_cy)
+                            length_end = (rect_cx + length/2, rect_cy)
+                            width_start = (rect_cx, rect_cy - width/2)
+                            width_end = (rect_cx, rect_cy + width/2)
+                        else:
+                            # Vertical orientation
+                            length_start = (rect_cx, rect_cy - length/2)
+                            length_end = (rect_cx, rect_cy + length/2)
+                            width_start = (rect_cx - width/2, rect_cy)
+                            width_end = (rect_cx + width/2, rect_cy)
+
+                    # Check if droplet centroid is inside the spatial ROI
+                    in_roi = (self.x_start <= cx < self.x_stop) and (self.y_start <= cy < self.y_stop)
 
                     droplet_info = {
-                        'x': abs_x,
-                        'y': abs_y,
+                        'x': cx,
+                        'y': cy,
                         'radius': radius,
                         'length': length,
                         'width': width,
-                        'angle': angle
+                        'angle': angle,
+                        'in_roi': in_roi,
+                        # Endpoint coordinates for tracking
+                        'length_start': length_start,  # (x, y) tuple - tail of streak
+                        'length_end': length_end,      # (x, y) tuple - head of streak
+                        'width_start': width_start,    # (x, y) tuple
+                        'width_end': width_end         # (x, y) tuple
                     }
                     droplet_data.append(droplet_info)
 
@@ -1034,21 +1273,30 @@ class DropletAnalyzer:
             if not ret:
                 break
 
-            # Detect droplets
+            # Detect droplets (processes entire frame, each droplet has 'in_roi' flag)
             count, droplet_data = self.detect_droplets(frame, threshold, min_area, max_area)
+
+            # Count droplets inside vs outside the spatial ROI
+            count_in_roi = sum(1 for d in droplet_data if d.get('in_roi', False))
+            count_total = count  # Total droplets in full frame
 
             # Store frame data with coordinates and results
             time_sec = current_frame / self.fps
             frame_info = {
                 'frame_number': current_frame,
                 'time_seconds': time_sec,
-                'droplet_count': count,
-                'droplets': droplet_data,  # List of dicts with x, y, radius, length, width, angle
+                'droplet_count': count_total,      # Total droplets in full frame
+                'droplet_count_in_roi': count_in_roi,  # Droplets inside spatial ROI
+                'droplets': droplet_data,  # List of dicts with x, y, radius, length, width, angle, in_roi
                 'roi_coordinates': {
                     'x_start': self.x_start,
                     'x_stop': self.x_stop,
                     'y_start': self.y_start,
                     'y_stop': self.y_stop
+                },
+                'frame_dimensions': {
+                    'width': self.frame_width,
+                    'height': self.frame_height
                 }
             }
             self.frame_data.append(frame_info)
@@ -1137,9 +1385,10 @@ class DropletAnalyzer:
                    [y - width_dy, y + width_dy],
                    'b-', linewidth=1.5, alpha=0.7)
 
-        # Calculate density
-        roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
-        density = droplet_count / roi_area if roi_area > 0 else 0
+        # Calculate density using beam cross-sectional area (π*r² where 2r = vertical ROI height)
+        beam_radius_px = (self.y_stop - self.y_start) / 2
+        beam_cross_section = np.pi * beam_radius_px**2
+        density = droplet_count / beam_cross_section if beam_cross_section > 0 else 0
 
         # Add title with frame and time info
         ax.set_title(f"First Analyzed Frame\n"
@@ -1177,66 +1426,167 @@ class DropletAnalyzer:
         return fig, ax
 
     def calculate_statistics(self):
-        """Calculate density statistics."""
+        """
+        Calculate density statistics with dual normalization.
+
+        Provides statistics normalized by:
+        1. Spatial ROI area (user-specified region)
+        2. Full frame area (effective area when analyzing entire frame)
+
+        Analysis runs on entire frames, so droplets are detected everywhere.
+        The 'in_roi' flag on each droplet indicates if it's in the spatial ROI.
+        """
         if not self.frame_data:
             raise ValueError("No data to analyze. Run analyze() first.")
 
-        # Calculate area of analysis region
-        roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
+        # Get frame dimensions from first frame (should be consistent)
+        frame_dims = self.frame_data[0].get('frame_dimensions', {})
+        frame_width = frame_dims.get('width', self.frame_width)
+        frame_height = frame_dims.get('height', self.frame_height)
+
+        # Calculate areas
+        # Spatial ROI area (user-specified)
+        roi_width = self.x_stop - self.x_start
+        roi_height = self.y_stop - self.y_start
+        roi_area_px2 = roi_width * roi_height
+
+        # Spatial ROI as cylindrical beam cross-section (π*r² where 2r = vertical ROI height)
+        roi_beam_radius_px = roi_height / 2
+        roi_beam_cross_section_px2 = np.pi * roi_beam_radius_px**2
+
+        # Full frame area
+        full_frame_area_px2 = frame_width * frame_height
+
+        # Full frame as cylindrical beam cross-section (π*r² where 2r = frame height)
+        full_beam_radius_px = frame_height / 2
+        full_beam_cross_section_px2 = np.pi * full_beam_radius_px**2
 
         # Extract counts from frame data
-        counts = np.array([frame['droplet_count'] for frame in self.frame_data])
+        # Total counts (full frame)
+        counts_total = np.array([frame['droplet_count'] for frame in self.frame_data])
+        # Counts in ROI only
+        counts_in_roi = np.array([frame.get('droplet_count_in_roi', frame['droplet_count'])
+                                  for frame in self.frame_data])
 
-        # Calculate statistics
-        mean_count = np.mean(counts)
-        std_count = np.std(counts)
+        # Calculate statistics for full frame
+        mean_count_total = np.mean(counts_total)
+        std_count_total = np.std(counts_total)
 
-        # Density (droplets per square pixel)
-        mean_density = mean_count / roi_area
-        std_density = std_count / roi_area
+        # Calculate statistics for ROI only
+        mean_count_roi = np.mean(counts_in_roi)
+        std_count_roi = np.std(counts_in_roi)
 
-        # Also calculate per 1000 square pixels for easier reading
-        mean_density_k = mean_density * 1000
-        std_density_k = std_density * 1000
+        # Density calculations
+        # 1. ROI-normalized (using ROI beam cross-section)
+        mean_density_roi = mean_count_roi / roi_beam_cross_section_px2
+        std_density_roi = std_count_roi / roi_beam_cross_section_px2
+
+        # 2. Full-frame-normalized (using full frame beam cross-section)
+        mean_density_full = mean_count_total / full_beam_cross_section_px2
+        std_density_full = std_count_total / full_beam_cross_section_px2
 
         results = {
             'frames_analyzed': self.frames_analyzed,
-            'roi_area_pixels': roi_area,
-            'mean_droplet_count': float(mean_count),
-            'std_droplet_count': float(std_count),
-            'min_droplet_count': int(np.min(counts)),
-            'max_droplet_count': int(np.max(counts)),
-            'mean_density_per_pixel': float(mean_density),
-            'std_density_per_pixel': float(std_density),
-            'mean_density_per_1000px': float(mean_density_k),
-            'std_density_per_1000px': float(std_density_k)
+
+            # Frame and ROI geometry
+            'frame_width': frame_width,
+            'frame_height': frame_height,
+            'frame_area_pixels': full_frame_area_px2,
+            'full_beam_radius_pixels': full_beam_radius_px,
+            'full_beam_cross_section_pixels': full_beam_cross_section_px2,
+
+            'roi_width': roi_width,
+            'roi_height': roi_height,
+            'roi_area_pixels': roi_area_px2,
+            'roi_beam_radius_pixels': roi_beam_radius_px,
+            'roi_beam_cross_section_pixels': roi_beam_cross_section_px2,
+
+            # Total counts (full frame analysis)
+            'mean_droplet_count_total': float(mean_count_total),
+            'std_droplet_count_total': float(std_count_total),
+            'min_droplet_count_total': int(np.min(counts_total)),
+            'max_droplet_count_total': int(np.max(counts_total)),
+
+            # ROI counts (droplets inside spatial ROI)
+            'mean_droplet_count_roi': float(mean_count_roi),
+            'std_droplet_count_roi': float(std_count_roi),
+            'min_droplet_count_roi': int(np.min(counts_in_roi)),
+            'max_droplet_count_roi': int(np.max(counts_in_roi)),
+
+            # Density normalized by ROI beam cross-section
+            'mean_density_roi_per_pixel': float(mean_density_roi),
+            'std_density_roi_per_pixel': float(std_density_roi),
+
+            # Density normalized by full-frame beam cross-section
+            'mean_density_full_per_pixel': float(mean_density_full),
+            'std_density_full_per_pixel': float(std_density_full),
+
+            # Legacy fields for backward compatibility
+            'beam_radius_pixels': roi_beam_radius_px,
+            'beam_cross_section_pixels': roi_beam_cross_section_px2,
+            'mean_droplet_count': float(mean_count_roi),  # ROI count for backward compat
+            'std_droplet_count': float(std_count_roi),
+            'min_droplet_count': int(np.min(counts_in_roi)),
+            'max_droplet_count': int(np.max(counts_in_roi)),
+            'mean_density_per_pixel': float(mean_density_roi),
+            'std_density_per_pixel': float(std_density_roi),
+            'mean_density_per_1000px': float(mean_density_roi * 1000),
+            'std_density_per_1000px': float(std_density_roi * 1000)
         }
 
         return results
 
     def print_results(self, results):
-        """Print analysis results."""
+        """Print analysis results with dual normalization."""
         # Conversion factor: pixels per micron
         pixels_per_um = 0.1878
-        roi_area_um2 = results['roi_area_pixels'] / (pixels_per_um ** 2)
 
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("DROPLET ANALYSIS RESULTS")
-        print("="*60)
+        print("="*70)
         print(f"Frames analyzed: {results['frames_analyzed']}")
-        print(f"Analysis region area: {results['roi_area_pixels']:,} pixels")
-        print(f"                      ({roi_area_um2:,.0f} μm²)")
-        print()
-        print(f"Mean droplet count per frame: {results['mean_droplet_count']:.2f}")
-        print(f"Std deviation of count: {results['std_droplet_count']:.2f}")
-        print(f"Min droplet count: {results['min_droplet_count']}")
-        print(f"Max droplet count: {results['max_droplet_count']}")
-        print()
-        print(f"Mean density: {results['mean_density_per_1000px']:.4f} droplets per 1000 px²")
-        print(f"              ({results['mean_density_per_1000px'] * 1000 / (pixels_per_um ** 2):.4f} droplets per 1000 μm²)")
-        print(f"Std density:  {results['std_density_per_1000px']:.4f} droplets per 1000 px²")
-        print(f"              ({results['std_density_per_1000px'] * 1000 / (pixels_per_um ** 2):.4f} droplets per 1000 μm²)")
-        print("="*60)
+
+        # Frame geometry
+        frame_w = results.get('frame_width', 0)
+        frame_h = results.get('frame_height', 0)
+        full_beam_r = results.get('full_beam_radius_pixels', 0)
+        full_beam_area = results.get('full_beam_cross_section_pixels', 0)
+        full_beam_area_mm2 = full_beam_area / (pixels_per_um ** 2) / 1e6
+
+        print(f"\nFull Frame Geometry:")
+        print(f"  Frame size: {frame_w} x {frame_h} px")
+        print(f"  Effective beam radius: {full_beam_r:.1f} px ({full_beam_r/pixels_per_um:.1f} um)")
+        print(f"  Effective beam cross-section: {full_beam_area:.0f} px^2 ({full_beam_area_mm2:.4f} mm^2)")
+
+        # ROI geometry
+        roi_w = results.get('roi_width', 0)
+        roi_h = results.get('roi_height', 0)
+        roi_beam_r = results.get('roi_beam_radius_pixels', 0)
+        roi_beam_area = results.get('roi_beam_cross_section_pixels', 0)
+        roi_beam_area_mm2 = roi_beam_area / (pixels_per_um ** 2) / 1e6
+
+        print(f"\nSpatial ROI Geometry:")
+        print(f"  ROI size: {roi_w} x {roi_h} px")
+        print(f"  ROI beam radius: {roi_beam_r:.1f} px ({roi_beam_r/pixels_per_um:.1f} um)")
+        print(f"  ROI beam cross-section: {roi_beam_area:.0f} px^2 ({roi_beam_area_mm2:.4f} mm^2)")
+
+        # Full frame counts
+        print(f"\n--- Full Frame Analysis (all detected droplets) ---")
+        print(f"Mean count per frame: {results.get('mean_droplet_count_total', 0):.2f} +/- {results.get('std_droplet_count_total', 0):.2f}")
+        print(f"Range: {results.get('min_droplet_count_total', 0)} to {results.get('max_droplet_count_total', 0)}")
+        density_full = results.get('mean_density_full_per_pixel', 0) * (pixels_per_um ** 2) * 1e6
+        std_density_full = results.get('std_density_full_per_pixel', 0) * (pixels_per_um ** 2) * 1e6
+        print(f"Density (full frame norm): {density_full:.1f} +/- {std_density_full:.1f} droplets/mm^2")
+
+        # ROI counts
+        print(f"\n--- Spatial ROI Analysis (droplets inside ROI) ---")
+        print(f"Mean count per frame: {results.get('mean_droplet_count_roi', 0):.2f} +/- {results.get('std_droplet_count_roi', 0):.2f}")
+        print(f"Range: {results.get('min_droplet_count_roi', 0)} to {results.get('max_droplet_count_roi', 0)}")
+        density_roi = results.get('mean_density_roi_per_pixel', 0) * (pixels_per_um ** 2) * 1e6
+        std_density_roi = results.get('std_density_roi_per_pixel', 0) * (pixels_per_um ** 2) * 1e6
+        print(f"Density (ROI norm): {density_roi:.1f} +/- {std_density_roi:.1f} droplets/mm^2")
+
+        print("="*70)
 
     def save_results(self, output_path):
         """Save results to JSON file."""
@@ -1248,10 +1598,17 @@ class DropletAnalyzer:
             'analysis_parameters': {
                 'start_time': self.start_time,
                 'end_time': self.end_time,
+                # Spatial ROI (for normalization, not for filtering)
                 'x_start': self.x_start,
                 'x_stop': self.x_stop,
                 'y_start': self.y_start,
-                'y_stop': self.y_stop
+                'y_stop': self.y_stop,
+                # Frame dimensions
+                'frame_width': self.frame_width,
+                'frame_height': self.frame_height,
+                # Pixel calibration
+                'pixels_per_um': 0.1878,
+                'fps': self.fps
             },
             'results': results,
             'frame_data': self.frame_data
@@ -1269,7 +1626,9 @@ class DropletAnalyzer:
         Save per-droplet data to a numpy binary file.
 
         Creates a structured array with one entry per droplet across all frames.
-        Each entry contains: frame_number, droplet_id, x, y, length, width
+        Each entry contains: frame_number, droplet_id, x, y, length, width, angle, in_roi
+
+        The in_roi field indicates whether the droplet centroid is inside the spatial ROI.
 
         Args:
             output_path: Path to save the .npy or .npz file
@@ -1292,30 +1651,139 @@ class DropletAnalyzer:
                     'y': droplet['y'],
                     'length': droplet['length'],
                     'width': droplet['width'],
-                    'angle': droplet['angle']
+                    'angle': droplet['angle'],
+                    'in_roi': droplet.get('in_roi', True)  # Default True for backward compat
                 })
 
-        # Convert to structured numpy array
+        # Convert to structured numpy array (in_roi stored as int: 0=False, 1=True)
         dtype = [('frame', 'i4'), ('droplet_id', 'i4'), ('x', 'f4'), ('y', 'f4'),
-                 ('length', 'f4'), ('width', 'f4'), ('angle', 'f4')]
+                 ('length', 'f4'), ('width', 'f4'), ('angle', 'f4'), ('in_roi', 'i4')]
 
         droplet_array = np.array([(d['frame'], d['droplet_id'], d['x'], d['y'],
-                                   d['length'], d['width'], d['angle'])
+                                   d['length'], d['width'], d['angle'], int(d['in_roi']))
                                   for d in all_droplets], dtype=dtype)
 
         # Save to file
         np.save(output_path, droplet_array)
+
+        # Count droplets in/out of ROI
+        n_in_roi = np.sum(droplet_array['in_roi'])
+        n_total = len(droplet_array)
+
         print(f"\nDroplet data saved to: {output_path}")
-        print(f"Total droplets across all frames: {len(droplet_array)}")
+        print(f"Total droplets across all frames: {n_total}")
+        print(f"  In spatial ROI: {n_in_roi}")
+        print(f"  Outside ROI: {n_total - n_in_roi}")
+
+        return droplet_array
+
+    def save_tracking_data_numpy(self, output_path):
+        """
+        Save per-droplet tracking data to a numpy binary file.
+
+        Creates a structured array with endpoint coordinates for each droplet,
+        suitable for tracking droplets across frames. Each droplet has:
+        - frame: Frame number
+        - droplet_id: Unique ID within the frame
+        - x, y: Centroid coordinates
+        - length, width, angle: Streak dimensions and orientation
+        - length_start_x, length_start_y: Tail of streak (start of length axis)
+        - length_end_x, length_end_y: Head of streak (end of length axis)
+        - width_start_x, width_start_y: Start of width axis
+        - width_end_x, width_end_y: End of width axis
+        - in_roi: Whether centroid is inside spatial ROI
+
+        Args:
+            output_path: Path to save the .npy file
+        """
+        if not self.frame_data:
+            raise ValueError("No data to save. Run analyze() first.")
+
+        # Collect all droplet data with tracking coordinates
+        all_droplets = []
+
+        for frame_info in self.frame_data:
+            frame_num = frame_info['frame_number']
+            droplets = frame_info.get('droplets', [])
+
+            for droplet_id, droplet in enumerate(droplets):
+                # Get endpoint coordinates (with fallback for old data)
+                length_start = droplet.get('length_start', (droplet['x'], droplet['y']))
+                length_end = droplet.get('length_end', (droplet['x'], droplet['y']))
+                width_start = droplet.get('width_start', (droplet['x'], droplet['y']))
+                width_end = droplet.get('width_end', (droplet['x'], droplet['y']))
+
+                all_droplets.append({
+                    'frame': frame_num,
+                    'droplet_id': droplet_id,
+                    'x': droplet['x'],
+                    'y': droplet['y'],
+                    'length': droplet['length'],
+                    'width': droplet['width'],
+                    'angle': droplet['angle'],
+                    'length_start_x': length_start[0],
+                    'length_start_y': length_start[1],
+                    'length_end_x': length_end[0],
+                    'length_end_y': length_end[1],
+                    'width_start_x': width_start[0],
+                    'width_start_y': width_start[1],
+                    'width_end_x': width_end[0],
+                    'width_end_y': width_end[1],
+                    'in_roi': droplet.get('in_roi', True)
+                })
+
+        # Convert to structured numpy array
+        dtype = [
+            ('frame', 'i4'),
+            ('droplet_id', 'i4'),
+            ('x', 'f4'),
+            ('y', 'f4'),
+            ('length', 'f4'),
+            ('width', 'f4'),
+            ('angle', 'f4'),
+            ('length_start_x', 'f4'),
+            ('length_start_y', 'f4'),
+            ('length_end_x', 'f4'),
+            ('length_end_y', 'f4'),
+            ('width_start_x', 'f4'),
+            ('width_start_y', 'f4'),
+            ('width_end_x', 'f4'),
+            ('width_end_y', 'f4'),
+            ('in_roi', 'i4')
+        ]
+
+        droplet_array = np.array([
+            (d['frame'], d['droplet_id'], d['x'], d['y'],
+             d['length'], d['width'], d['angle'],
+             d['length_start_x'], d['length_start_y'],
+             d['length_end_x'], d['length_end_y'],
+             d['width_start_x'], d['width_start_y'],
+             d['width_end_x'], d['width_end_y'],
+             int(d['in_roi']))
+            for d in all_droplets
+        ], dtype=dtype)
+
+        # Save to file
+        np.save(output_path, droplet_array)
+
+        # Summary
+        n_frames = len(set(droplet_array['frame']))
+        n_total = len(droplet_array)
+
+        print(f"\nTracking data saved to: {output_path}")
+        print(f"  Frames: {n_frames}")
+        print(f"  Total droplets: {n_total}")
+        print(f"  Fields: frame, droplet_id, x, y, length, width, angle,")
+        print(f"          length_start/end (x,y), width_start/end (x,y), in_roi")
 
         return droplet_array
 
     def plot_histograms(self, save_path=None):
         """
-        Create three histograms:
-        1. Droplet count per frame with twin axis for density
-        2. Streak length distribution (all droplets)
-        3. Streak width distribution (all droplets)
+        Create three histograms with distribution fits:
+        1. Droplet count per frame - Poisson fit
+        2. Streak length - width distribution - Half-Gaussian (Maxwell-Boltzmann projection) fit
+        3. Streak width distribution - Poisson fit
 
         Args:
             save_path: Optional path to save the plot. If None, displays interactively.
@@ -1323,85 +1791,190 @@ class DropletAnalyzer:
         if not self.frame_data:
             raise ValueError("No data to plot. Run analyze() first.")
 
-        # Collect data
-        counts = []
+        # Collect data (use droplets inside ROI for consistency with ROI normalization)
+        counts = []        # Counts of droplets in ROI per frame
+        counts_total = []  # Total counts per frame (full frame)
         lengths = []
         widths = []
 
         for frame_info in self.frame_data:
-            counts.append(frame_info['droplet_count'])
+            # Use ROI count if available, otherwise fall back to total count
+            counts.append(frame_info.get('droplet_count_in_roi', frame_info['droplet_count']))
+            counts_total.append(frame_info['droplet_count'])
             droplets = frame_info.get('droplets', [])
 
             for droplet in droplets:
-                lengths.append(droplet['length'])
-                widths.append(droplet['width'])
+                # Only include droplets inside ROI for length/width histograms
+                if droplet.get('in_roi', True):
+                    lengths.append(droplet['length'])
+                    widths.append(droplet['width'])
 
-        # Calculate ROI area for density
-        roi_area = (self.x_stop - self.x_start) * (self.y_stop - self.y_start)
+        # Calculate beam cross-sectional area for density (π*r² where 2r = vertical ROI height)
+        beam_radius_px = (self.y_stop - self.y_start) / 2
+        beam_cross_section = np.pi * beam_radius_px**2
 
         # Conversion factor: pixels per micron
         pixels_per_um = 0.1878
-        roi_area_um2 = roi_area / (pixels_per_um ** 2)
+        pixels_per_mm = pixels_per_um * 1000  # 1 mm = 1000 μm
+        beam_cross_section_um2 = beam_cross_section / (pixels_per_um ** 2)
+        beam_cross_section_mm2 = beam_cross_section_um2 / 1e6  # 1 mm² = 1,000,000 μm²
 
         # Create figure with 3 subplots
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
-        # Histogram 1: Droplet count per frame with density twin x-axis
-        # Create bins with width 1 for count histogram
+        # =====================================================================
+        # Histogram 1: Droplet count per frame with Poisson fit
+        # =====================================================================
         count_bins = np.arange(min(counts), max(counts) + 2, 1) if counts else [0, 1]
-        ax1.hist(counts, bins=count_bins, alpha=0.7, color='blue', edgecolor='black')
+        ax1.hist(counts, bins=count_bins, alpha=0.7,
+                 color='blue', edgecolor='black', density=True)
         ax1.set_xlabel('Droplet Count per Frame', fontsize=12)
-        ax1.set_ylabel('Frequency (Number of Frames)', fontsize=12)
-        ax1.set_title('Droplet Count Distribution', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Probability Density', fontsize=12)
+        ax1.set_title('Droplet Count Distribution\n(Poisson Fit)', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
 
-        # Twin x-axis for density in droplets/μm²
+        # Fit Poisson distribution (λ = mean for Poisson)
+        lambda_count = np.mean(counts)
+        x_poisson = np.arange(min(counts), max(counts) + 1)
+        poisson_pmf = stats.poisson.pmf(x_poisson, lambda_count)
+        ax1.plot(x_poisson, poisson_pmf, 'r-', linewidth=2,
+                label=f'Poisson fit: λ = {lambda_count:.2f}')
+
+        # Twin x-axis for density in droplets/mm² (using beam cross-section)
         ax1_twin = ax1.twiny()
         ax1_xlim = ax1.get_xlim()
-        ax1_twin.set_xlim(ax1_xlim[0] / roi_area_um2, ax1_xlim[1] / roi_area_um2)
-        ax1_twin.set_xlabel('Density (droplets/μm²)', fontsize=12, color='blue')
+        ax1_twin.set_xlim(ax1_xlim[0] / beam_cross_section_mm2, ax1_xlim[1] / beam_cross_section_mm2)
+        ax1_twin.set_xlabel('Density (droplets/mm² beam)', fontsize=12, color='blue')
         ax1_twin.tick_params(axis='x', labelcolor='blue')
 
-        # Add statistics to plot
+        # Add statistics
         mean_count = np.mean(counts)
         std_count = np.std(counts)
+        mean_count_per_mm2 = mean_count / beam_cross_section_mm2
+        std_count_per_mm2 = std_count / beam_cross_section_mm2
         ax1.axvline(mean_count, color='darkblue', linestyle='--', linewidth=2,
-                   label=f'Mean: {mean_count:.1f} ± {std_count:.1f}')
-        ax1.legend(fontsize=10)
+                   label=f'Mean: {mean_count:.2f} ± {std_count:.2f} counts\n'
+                         f'        {mean_count_per_mm2:.1f} ± {std_count_per_mm2:.1f} /mm²')
+        ax1.legend(fontsize=9)
 
-        # Histogram 2: Streak length with velocity twin x-axis
-        # Create bins with width 1 for length histogram
-        length_bins = np.arange(int(min(lengths)), int(max(lengths)) + 2, 1) if lengths else [0, 1]
-        ax2.hist(lengths, bins=length_bins, alpha=0.7, color='green', edgecolor='black')
-        ax2.set_xlabel('Streak Length (pixels)', fontsize=12)
-        ax2.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
-        ax2.set_title('Streak Length Distribution', fontsize=14, fontweight='bold')
+        # =====================================================================
+        # Histogram 2: Streak length - width with dwell-time biased MB fit
+        # =====================================================================
+        # Compute length-width for each droplet (projected velocity proxy)
+        length_minus_width = np.array([l - w for l, w in zip(lengths, widths)])
+
+        # Create bins with width 1
+        lm_width_bins = np.arange(int(min(length_minus_width)), int(max(length_minus_width)) + 2, 1) if len(length_minus_width) > 0 else [0, 1]
+        hist_counts, bin_edges = np.histogram(length_minus_width, bins=lm_width_bins)
+        bin_centers_px = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        ax2.hist(length_minus_width, bins=lm_width_bins, alpha=0.7,
+                 color='green', edgecolor='black', density=True)
+        ax2.set_xlabel('Streak Length - Width (pixels)', fontsize=12)
+        ax2.set_ylabel('Probability Density', fontsize=12)
+        ax2.set_title('Projected Speed Distribution\n(Dwell-Time Biased MB Fit)', fontsize=14, fontweight='bold')
         ax2.grid(True, alpha=0.3)
 
-        # Twin x-axis for velocity in μm/s
-        # Velocity = (length in μm) × frame_rate = (length in pixels / pixels_per_um) × fps
+        # Fit with dwell-time biased Maxwell-Boltzmann model
+        # Convert to physical units for fitting
+        # Speed: pixels -> m/s
+        pixels_per_m = pixels_per_um * 1e6
+        bin_centers_mps = bin_centers_px / pixels_per_m * self.fps  # m/s
+
+        # Estimate droplet mass from mean width (assuming spherical droplets)
+        # Density of liquid xenon ~ 3000 kg/m³ (approximate)
+        mean_width_m = np.mean(widths) / pixels_per_m
+        droplet_radius_m = mean_width_m / 2
+        droplet_density = 3000  # kg/m³ (liquid xenon approximate)
+        droplet_mass = (4/3) * np.pi * droplet_radius_m**3 * droplet_density
+
+        # Beam waist from ROI height
+        beam_waist_m = (self.y_stop - self.y_start) / pixels_per_m
+
+        # Fit only positive speeds
+        positive_mask = bin_centers_px >= 0
+        u_fit = bin_centers_mps[positive_mask]
+        counts_fit = hist_counts[positive_mask]
+
+        T_fit, T_err = np.nan, np.nan
+        sigma_velocity = np.nan
+
+        if len(u_fit) > 5 and np.sum(counts_fit) > 0:
+            try:
+                # Use analytic approximation (faster)
+                T_fit, T_err = fit_temperature_from_speed(
+                    u_fit, counts_fit, droplet_mass,
+                    w0=beam_waist_m, use_mc=False
+                )
+
+                # Calculate velocity spread from fitted temperature
+                # σ² = k_B T / m
+                if not np.isnan(T_fit):
+                    sigma_velocity_mps = np.sqrt(kB * T_fit / droplet_mass)
+                    sigma_velocity = sigma_velocity_mps * 1000  # mm/s
+
+                    # Plot the fit
+                    x_fit_px = np.linspace(0, max(length_minus_width[length_minus_width >= 0]) * 1.2, 200)
+                    x_fit_mps = x_fit_px / pixels_per_m * self.fps
+                    y_fit = approx_observed_pdf(x_fit_mps, T_fit, droplet_mass)
+                    # Scale to match histogram normalization
+                    y_fit_scaled = y_fit * (self.fps / pixels_per_m)
+                    ax2.plot(x_fit_px, y_fit_scaled, 'r-', linewidth=2,
+                            label=f'MB fit: T = {T_fit:.1f} K')
+
+            except Exception as e:
+                print(f"Temperature fit failed: {e}")
+                # Fallback to simple RMS estimate
+                positive_lmw = length_minus_width[length_minus_width >= 0]
+                sigma_fit_px = np.sqrt(np.mean(positive_lmw**2)) if len(positive_lmw) > 0 else 1
+                sigma_velocity = sigma_fit_px / pixels_per_mm * self.fps
+        else:
+            # Fallback
+            positive_lmw = length_minus_width[length_minus_width >= 0]
+            sigma_fit_px = np.sqrt(np.mean(positive_lmw**2)) if len(positive_lmw) > 0 else 1
+            sigma_velocity = sigma_fit_px / pixels_per_mm * self.fps
+
+        # Twin x-axis for velocity in mm/s
         ax2_twin = ax2.twiny()
-        velocity_factor = self.fps / pixels_per_um
+        velocity_factor = self.fps / pixels_per_mm
         ax2_xlim = ax2.get_xlim()
         ax2_twin.set_xlim(ax2_xlim[0] * velocity_factor, ax2_xlim[1] * velocity_factor)
-        ax2_twin.set_xlabel('Velocity (μm/s)', fontsize=12, color='darkgreen')
+        ax2_twin.set_xlabel('Projected Speed (mm/s)', fontsize=12, color='darkgreen')
         ax2_twin.tick_params(axis='x', labelcolor='darkgreen')
 
         # Add statistics
-        mean_length = np.mean(lengths)
-        std_length = np.std(lengths)
-        ax2.axvline(mean_length, color='darkgreen', linestyle='--', linewidth=2,
-                   label=f'Mean: {mean_length:.2f} ± {std_length:.2f} px')
-        ax2.legend(fontsize=10)
+        mean_lmw = np.mean(length_minus_width)
+        std_lmw = np.std(length_minus_width)
+        mean_velocity = mean_lmw / pixels_per_mm * self.fps
+        std_velocity = std_lmw / pixels_per_mm * self.fps
+        if not np.isnan(T_fit):
+            ax2.axvline(mean_lmw, color='darkgreen', linestyle='--', linewidth=2,
+                       label=f'Mean: {mean_lmw:.2f} ± {std_lmw:.2f} px\n'
+                             f'        {mean_velocity:.2f} ± {std_velocity:.2f} mm/s\n'
+                             f'        T = {T_fit:.1f} K')
+        else:
+            ax2.axvline(mean_lmw, color='darkgreen', linestyle='--', linewidth=2,
+                       label=f'Mean: {mean_lmw:.2f} ± {std_lmw:.2f} px\n'
+                             f'        {mean_velocity:.2f} ± {std_velocity:.2f} mm/s')
+        ax2.legend(fontsize=9)
 
-        # Histogram 3: Streak width with μm twin x-axis
-        # Create bins with width 1 for width histogram
+        # =====================================================================
+        # Histogram 3: Streak width with Poisson fit
+        # =====================================================================
         width_bins = np.arange(int(min(widths)), int(max(widths)) + 2, 1) if widths else [0, 1]
-        ax3.hist(widths, bins=width_bins, alpha=0.7, color='orange', edgecolor='black')
+        ax3.hist(widths, bins=width_bins, alpha=0.7,
+                 color='orange', edgecolor='black', density=True)
         ax3.set_xlabel('Streak Width at Midpoint (pixels)', fontsize=12)
-        ax3.set_ylabel('Frequency (Number of Droplets)', fontsize=12)
-        ax3.set_title('Streak Width Distribution', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Probability Density', fontsize=12)
+        ax3.set_title('Streak Width Distribution\n(Poisson Fit)', fontsize=14, fontweight='bold')
         ax3.grid(True, alpha=0.3)
+
+        # Fit Poisson distribution (λ = mean)
+        lambda_width = np.mean(widths)
+        x_poisson_w = np.arange(int(min(widths)), int(max(widths)) + 1)
+        poisson_pmf_w = stats.poisson.pmf(x_poisson_w, lambda_width)
+        ax3.plot(x_poisson_w, poisson_pmf_w, 'r-', linewidth=2,
+                label=f'Poisson fit: λ = {lambda_width:.2f} px')
 
         # Twin x-axis for width in μm
         ax3_twin = ax3.twiny()
@@ -1413,9 +1986,12 @@ class DropletAnalyzer:
         # Add statistics
         mean_width = np.mean(widths)
         std_width = np.std(widths)
+        mean_width_um = mean_width / pixels_per_um
+        std_width_um = std_width / pixels_per_um
         ax3.axvline(mean_width, color='darkorange', linestyle='--', linewidth=2,
-                   label=f'Mean: {mean_width:.2f} ± {std_width:.2f} px')
-        ax3.legend(fontsize=10)
+                   label=f'Mean: {mean_width:.2f} ± {std_width:.2f} px\n'
+                         f'        {mean_width_um:.2f} ± {std_width_um:.2f} μm')
+        ax3.legend(fontsize=9)
 
         # Add overall statistics text
         total_droplets = len(lengths)
@@ -1431,23 +2007,37 @@ class DropletAnalyzer:
         else:
             plt.show()
 
-        # Print summary statistics
+        # Print summary statistics with fit results
         print("\n" + "="*60)
-        print("DROPLET STREAK STATISTICS")
+        print("DROPLET ANALYSIS WITH DISTRIBUTION FITS")
         print("="*60)
         print(f"Total droplets analyzed: {total_droplets}")
-        print(f"\nStreak measurements:")
-        print(f"  Mean length: {mean_length:.2f} ± {std_length:.2f} pixels")
-        print(f"              ({mean_length/pixels_per_um:.2f} ± {std_length/pixels_per_um:.2f} μm)")
-        print(f"  Mean width:  {mean_width:.2f} ± {std_width:.2f} pixels")
-        print(f"              ({mean_width/pixels_per_um:.2f} ± {std_width/pixels_per_um:.2f} μm)")
-        print(f"  Aspect ratio: {mean_length/mean_width:.2f}")
-        print(f"\nVelocity (assuming streak length = distance per frame):")
-        mean_velocity = (mean_length / pixels_per_um) * self.fps
-        std_velocity = (std_length / pixels_per_um) * self.fps
-        print(f"  Mean velocity: {mean_velocity:.2f} ± {std_velocity:.2f} μm/s")
-        print(f"\nSpatial calibration: {pixels_per_um:.4f} pixels/μm")
-        print(f"Temporal resolution: {self.fps:.2f} fps")
+        print(f"Frames analyzed: {self.frames_analyzed}")
+        beam_radius_um = beam_radius_px / pixels_per_um
+        print(f"Beam geometry: r = {beam_radius_px:.1f} px ({beam_radius_um:.1f} μm), A = π*r² = {beam_cross_section_mm2:.4f} mm²")
+
+        print(f"\n--- Droplet Count (Poisson Fit) ---")
+        print(f"  λ (Poisson parameter): {lambda_count:.2f} droplets/frame")
+        print(f"  Mean count: {mean_count:.2f} ± {std_count:.2f}")
+        print(f"  Density: {mean_count_per_mm2:.1f} droplets/mm² (beam cross-section)")
+
+        print(f"\n--- Projected Speed (Dwell-Time Biased MB Fit) ---")
+        if not np.isnan(T_fit):
+            print(f"  Fitted temperature: {T_fit:.1f} ± {T_err:.1f} K")
+            print(f"  σ_v (from T): {sigma_velocity:.2f} mm/s")
+        print(f"  Mean |v_x|: {np.mean(np.abs(length_minus_width)):.2f} pixels")
+        print(f"  RMS v_x: {np.sqrt(np.mean(length_minus_width**2)):.2f} pixels")
+        print(f"  Estimated droplet mass: {droplet_mass:.2e} kg")
+        print(f"  Estimated droplet radius: {droplet_radius_m*1e6:.2f} μm")
+
+        print(f"\n--- Streak Width (Poisson Fit) ---")
+        print(f"  λ (Poisson parameter): {lambda_width:.2f} pixels")
+        print(f"  λ in physical units: {lambda_width/pixels_per_um:.2f} μm")
+        print(f"  Mean width: {mean_width:.2f} ± {std_width:.2f} pixels")
+
+        print(f"\n--- Calibration ---")
+        print(f"  Spatial: {pixels_per_um:.4f} pixels/μm")
+        print(f"  Temporal: {self.fps:.2f} fps")
         print("="*60)
 
 
@@ -1588,26 +2178,23 @@ if __name__ == '__main__':
         max_area=TEST_MAX_AREA,
         view_frames=TEST_VIEW_FRAMES
     )
-
-    # Calculate and print results
-    results = analyzer.calculate_statistics()
-    analyzer.print_results(results)
-
-    # Plot the first analyzed frame with annotations (shows length/width lines)
-    analyzer.plot_first_frame()
-    # Or save to file instead:
-    # analyzer.plot_first_frame(save_path='first_frame_annotated.png')
-
-    # Create histograms showing droplet count, length, and width distributions
-    analyzer.plot_histograms()
-    # Or save to file instead:
-    # analyzer.plot_histograms(save_path='droplet_histograms.png')
-
     # Save per-droplet data to numpy binary file
     analyzer.save_droplet_data_numpy('droplet_data.npy')
 
     # Optionally save results to JSON
-    # analyzer.save_results('test_results.json')
+    analyzer.save_results('test_results.json')
+
+    # Use analyze_distributions for all statistics and plotting
+    import analyze_distributions
+    per_droplet = analyze_distributions.load_droplet_data('droplet_data.npy', results_json='test_results.json')
+    # Step 1: Independent analysis + plots (density fixed at 3520 kg/m^3 by default)
+    step1 = analyze_distributions.analyze_independent(
+        per_droplet,
+        density_kg_m3=3520.0,
+        save_path=None
+    )
+    # Step 2: Combined analysis (scaffold)
+    step2 = analyze_distributions.analyze_combined(step1, per_droplet)
 
     # Uncomment to use command line arguments instead:
     # main()
