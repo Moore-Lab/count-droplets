@@ -2,6 +2,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
@@ -268,6 +269,69 @@ def link_droplets_by_endpoints(data, max_distance=50.0):
     for tid in tracks.keys():
         tracks[tid].sort(key=lambda rec: rec["frame"])
     return tracks
+
+
+# -----------------------------
+# Save track data
+# -----------------------------
+
+def save_track_data(endpoints_by_track, filepath="track_data.npz",
+                    fps=30.0, pixels_per_um=0.1878,
+                    max_distance=None, min_track_length=None):
+    """
+    Flatten endpoints_by_track into a structured array with pre-computed
+    velocities and save as .npz for downstream analysis.
+
+    Velocity is computed from the linking displacement (prev_end -> curr_start)
+    divided by the inter-frame time.  First observation per track gets NaN.
+    """
+    rows = []
+    dt_frame = 1.0 / fps
+
+    for tid, recs in endpoints_by_track.items():
+        for i, rec in enumerate(recs):
+            if i == 0:
+                vx = vy = speed = direction = np.nan
+            else:
+                prev = recs[i - 1]
+                dx = rec["start"][0] - prev["end"][0]
+                dy = rec["start"][1] - prev["end"][1]
+                n_frames = rec["frame"] - prev["frame"]
+                dt = n_frames * dt_frame
+                if dt > 0:
+                    vx = dx / dt
+                    vy = dy / dt
+                else:
+                    vx = vy = np.nan
+                speed = np.hypot(vx, vy)
+                direction = np.degrees(np.arctan2(vy, vx)) % 360.0
+            rows.append((tid, rec["frame"],
+                         rec["start"][0], rec["start"][1],
+                         rec["end"][0], rec["end"][1],
+                         vx, vy, speed, direction))
+
+    dtype = [('track_id', 'i4'), ('frame', 'i4'),
+             ('start_x', 'f4'), ('start_y', 'f4'),
+             ('end_x', 'f4'), ('end_y', 'f4'),
+             ('vx', 'f4'), ('vy', 'f4'),
+             ('speed', 'f4'), ('direction', 'f4')]
+
+    track_array = np.array(rows, dtype=dtype) if rows else np.array([], dtype=dtype)
+
+    metadata = json.dumps({
+        "fps": fps,
+        "pixels_per_um": pixels_per_um,
+        "max_distance": max_distance,
+        "min_track_length": min_track_length,
+        "n_tracks": len(endpoints_by_track),
+        "n_observations": len(rows),
+    })
+
+    np.savez(filepath,
+             track_observations=track_array,
+             metadata=np.array(metadata))
+    print(f"[save] Track data saved to: {filepath} "
+          f"({len(endpoints_by_track)} tracks, {len(rows)} observations)")
 
 
 # -----------------------------
@@ -803,7 +867,9 @@ def main(
     plot_tracks=True,
     plot_summed_track_id=None,
     summed_padding=50,
-    summed_save_path=None
+    summed_save_path=None,
+    fps=30.0,
+    pixels_per_um=0.1878,
 ):
     """
     Main tracking and visualization pipeline.
@@ -902,6 +968,17 @@ def main(
                 save_path=summed_save_path
             )
 
+    # Save track data for downstream analysis
+    save_track_data(endpoints_by_track, "track_data.npz",
+                    fps=fps, pixels_per_um=pixels_per_um,
+                    max_distance=max_distance,
+                    min_track_length=min_track_length)
+
+    # Run track-based analysis
+    import analyze_tracks
+    track_data = analyze_tracks.load_track_data("track_data.npz")
+    analyze_tracks.analyze_tracks(track_data)
+
     return endpoints_by_track
 
 
@@ -928,5 +1005,7 @@ if __name__ == "__main__":
         min_track_length=min_track_length,
         plot_summed_track_id=plot_summed_track_id,
         summed_padding=summed_padding,
-        summed_save_path=summed_save_path
+        summed_save_path=summed_save_path,
+        fps=30.0,
+        pixels_per_um=0.1878,
     )

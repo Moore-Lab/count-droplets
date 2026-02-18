@@ -159,6 +159,32 @@ def fit_rayleigh(data: np.ndarray) -> Tuple[float, float]:
     return sigma_fit, sigma_err
 
 
+def half_normal_pdf(x: np.ndarray, sigma: float) -> np.ndarray:
+    """Half-normal PDF: f(x; sigma) = sqrt(2/pi) / sigma * exp(-x^2 / (2*sigma^2)),  x >= 0"""
+    x = np.asarray(x, float)
+    if sigma <= 0:
+        return np.zeros_like(x)
+    pdf = np.sqrt(2.0 / np.pi) / sigma * np.exp(-x**2 / (2.0 * sigma**2))
+    return np.where(x >= 0, pdf, 0.0)
+
+
+def fit_half_normal(data: np.ndarray) -> Tuple[float, float]:
+    """
+    Fit a half-normal distribution to positive speed data using MLE.
+    Returns (sigma, sigma_err).
+    MLE: sigma = sqrt(mean(x^2)).
+    """
+    data = np.asarray(data, float)
+    data = data[np.isfinite(data) & (data >= 0)]
+    if data.size == 0:
+        return np.nan, np.nan
+
+    sigma = np.sqrt(np.mean(data**2))
+    sigma_err = sigma / np.sqrt(2.0 * data.size)
+
+    return sigma, sigma_err
+
+
 # =============================================================================
 # STEP 1: Independent analysis (plots + per-channel results)
 # =============================================================================
@@ -183,6 +209,7 @@ def analyze_independent(
     counts  = np.asarray(per_droplet['counts'])
     lengths = np.asarray(per_droplet['lengths'])
     widths  = np.asarray(per_droplet['widths'])
+    angles  = np.asarray(per_droplet['angles'])
     metadata = per_droplet.get('metadata', {})
 
     # Calibration
@@ -222,10 +249,22 @@ def analyze_independent(
 
     beam_cross_section_mm2 = (np.pi * beam_waist_px**2) / (pixels_per_um**2) / 1e6
 
-    # --- Figure: 2 rows x 3 cols (top=histograms, bottom=residuals) ---
-    fig, axes = plt.subplots(2, 3, figsize=(18, 8), gridspec_kw={'height_ratios': [3, 1]})
+    # --- Figure: 4 rows x 3 cols (rows 1-2: histograms+residuals, rows 3-4: projected speeds+residuals) ---
+    fig, axes = plt.subplots(4, 3, figsize=(18, 16),
+                             gridspec_kw={'height_ratios': [3, 1, 3, 1]})
     ax1, ax2, ax3 = axes[0]
     ax1_res, ax2_res, ax3_res = axes[1]
+    ax4, ax5, ax6 = axes[2]
+    ax4_res, ax5_res, ax6_res = axes[3]
+
+    # Replace the bottom-right cells (col 2, rows 3-4) with a single polar axis
+    pos6 = ax6.get_position()
+    pos6r = ax6_res.get_position()
+    ax6.remove()
+    ax6_res.remove()
+    # Span both rows: from bottom of residual to top of histogram
+    polar_bbox = [pos6.x0, pos6r.y0, pos6.width, pos6.y1 - pos6r.y0]
+    ax_polar = fig.add_axes(polar_bbox, polar=True)
 
     # ============================================================
     # 1) Counts per frame (Poisson) + residuals
@@ -464,6 +503,223 @@ def analyze_independent(
     ax3_t.set_xlabel('Speed (mm/s)', fontsize=11, color='darkgreen')
     ax3_t.tick_params(axis='x', labelcolor='darkgreen')
 
+    # ============================================================
+    # 4) Projected speed: y (vertical) - Half-normal fit + residuals
+    # ============================================================
+    # Streak angle gives orientation only (no direction), so projections
+    # are unsigned magnitudes: |v * sin(angle)|, |v * cos(angle)|.
+    angles_valid = np.deg2rad(angles[valid_len_mask])
+    v_y = np.abs(v_mps * np.sin(angles_valid))  # vertical projection (magnitude)
+    v_z = np.abs(v_mps * np.cos(angles_valid))  # horizontal projection (magnitude)
+
+    # --- y projection ---
+    sigma_y, sigma_y_err = np.nan, np.nan
+    chi2_red_vy = np.nan
+
+    if v_y.size > 0:
+        sigma_y, sigma_y_err = fit_half_normal(v_y)
+
+        vy_min, vy_max = 0.0, float(np.max(v_y))
+        n_bins_vy = 30
+        vy_bins = np.linspace(vy_min, vy_max, n_bins_vy + 1) if vy_max > vy_min else np.array([0.0, 1.0])
+        bin_centers_vy = (vy_bins[:-1] + vy_bins[1:]) / 2.0
+        bin_width_vy = vy_bins[1] - vy_bins[0] if len(vy_bins) > 1 else 1.0
+
+        hist_vy, _ = np.histogram(v_y, bins=vy_bins)
+        n_total_vy = v_y.size
+
+        expected_vy = n_total_vy * bin_width_vy * half_normal_pdf(bin_centers_vy, sigma_y)
+        residuals_vy, chi2_red_vy, _ = compute_chi2_residuals(hist_vy, expected_vy, n_params=1)
+
+        errors_vy = np.sqrt(hist_vy)
+        errors_vy[errors_vy == 0] = 1
+
+        hist_density_vy = hist_vy / (n_total_vy * bin_width_vy)
+        errors_density_vy = errors_vy / (n_total_vy * bin_width_vy)
+
+        ax4.stairs(hist_density_vy, vy_bins, color='mediumpurple', linewidth=2, label='Data')
+        ax4.errorbar(bin_centers_vy, hist_density_vy, yerr=errors_density_vy,
+                     fmt='none', ecolor='mediumpurple', capsize=3, capthick=1.5, elinewidth=1.5)
+
+        x_fit_vy = np.linspace(0, vy_max, 1000)
+        y_fit_vy = half_normal_pdf(x_fit_vy, sigma_y)
+        hn_mean_y = sigma_y * np.sqrt(2.0 / np.pi)
+        ax4.plot(x_fit_vy, y_fit_vy, 'r-', lw=2,
+                 label=f'Half-normal: $\\sigma$ = {sigma_y*1e3:.3f} +/- {sigma_y_err*1e3:.3f} mm/s\n'
+                       f'$\\chi^2_{{red}}$ = {chi2_red_vy:.2f}')
+
+        vy_data_mean = float(np.mean(v_y))
+        ax4.axvline(vy_data_mean, color='purple', linestyle='--', linewidth=2,
+                    label=f'Mean (data): {vy_data_mean*1e3:.2f} mm/s')
+        ax4.axvline(hn_mean_y, color='red', linestyle=':', linewidth=2,
+                    label=f'Mean (fit): {hn_mean_y*1e3:.2f} mm/s')
+
+        ax4.legend(fontsize=9)
+        ax4.set_xlim(0, vy_max if vy_max > 0 else 1.0)
+        ax4.set_ylim(0, np.max(hist_density_vy) * 1.3)
+
+        ax4_res.bar(bin_centers_vy, residuals_vy, width=0.8*bin_width_vy,
+                    color='mediumpurple', alpha=0.7, edgecolor='black')
+        ax4_res.axhline(0, color='black', linestyle='-', linewidth=1)
+        ax4_res.axhline(2, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        ax4_res.axhline(-2, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        ax4_res.set_xlim(ax4.get_xlim())
+        ax4_res.set_ylabel('Residuals\n$(O-E)/\\sqrt{E}$', fontsize=10)
+        ax4_res.set_xlabel('$|v_r|$ (m/s)', fontsize=12)
+        ax4_res.grid(True, alpha=0.3)
+
+    ax4.set_ylabel('Probability Density', fontsize=12)
+    ax4.set_title('$|v_r|$ (proj)', fontsize=13, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    ax4.set_xticklabels([])
+
+    ax4_t = ax4.twiny()
+    x4lim = ax4.get_xlim()
+    ax4_t.set_xlim(x4lim[0] * 1e3, x4lim[1] * 1e3)
+    ax4_t.set_xlabel('$|v_r|$ (mm/s)', fontsize=11, color='purple')
+    ax4_t.tick_params(axis='x', labelcolor='purple')
+
+    # ============================================================
+    # 5) Projected speed: z (horizontal) - Half-normal fit + residuals
+    # ============================================================
+    sigma_z, sigma_z_err = np.nan, np.nan
+    chi2_red_vz = np.nan
+
+    if v_z.size > 0:
+        sigma_z, sigma_z_err = fit_half_normal(v_z)
+
+        vz_min, vz_max = 0.0, float(np.max(v_z))
+        n_bins_vz = 30
+        vz_bins = np.linspace(vz_min, vz_max, n_bins_vz + 1) if vz_max > vz_min else np.array([0.0, 1.0])
+        bin_centers_vz = (vz_bins[:-1] + vz_bins[1:]) / 2.0
+        bin_width_vz = vz_bins[1] - vz_bins[0] if len(vz_bins) > 1 else 1.0
+
+        hist_vz, _ = np.histogram(v_z, bins=vz_bins)
+        n_total_vz = v_z.size
+
+        expected_vz = n_total_vz * bin_width_vz * half_normal_pdf(bin_centers_vz, sigma_z)
+        residuals_vz, chi2_red_vz, _ = compute_chi2_residuals(hist_vz, expected_vz, n_params=1)
+
+        errors_vz = np.sqrt(hist_vz)
+        errors_vz[errors_vz == 0] = 1
+
+        hist_density_vz = hist_vz / (n_total_vz * bin_width_vz)
+        errors_density_vz = errors_vz / (n_total_vz * bin_width_vz)
+
+        ax5.stairs(hist_density_vz, vz_bins, color='coral', linewidth=2, label='Data')
+        ax5.errorbar(bin_centers_vz, hist_density_vz, yerr=errors_density_vz,
+                     fmt='none', ecolor='coral', capsize=3, capthick=1.5, elinewidth=1.5)
+
+        x_fit_vz = np.linspace(0, vz_max, 1000)
+        y_fit_vz = half_normal_pdf(x_fit_vz, sigma_z)
+        hn_mean_z = sigma_z * np.sqrt(2.0 / np.pi)
+        ax5.plot(x_fit_vz, y_fit_vz, 'r-', lw=2,
+                 label=f'Half-normal: $\\sigma$ = {sigma_z*1e3:.3f} +/- {sigma_z_err*1e3:.3f} mm/s\n'
+                       f'$\\chi^2_{{red}}$ = {chi2_red_vz:.2f}')
+
+        vz_data_mean = float(np.mean(v_z))
+        ax5.axvline(vz_data_mean, color='orangered', linestyle='--', linewidth=2,
+                    label=f'Mean (data): {vz_data_mean*1e3:.2f} mm/s')
+        ax5.axvline(hn_mean_z, color='red', linestyle=':', linewidth=2,
+                    label=f'Mean (fit): {hn_mean_z*1e3:.2f} mm/s')
+
+        ax5.legend(fontsize=9)
+        ax5.set_xlim(0, vz_max if vz_max > 0 else 1.0)
+        ax5.set_ylim(0, np.max(hist_density_vz) * 1.3)
+
+        ax5_res.bar(bin_centers_vz, residuals_vz, width=0.8*bin_width_vz,
+                    color='coral', alpha=0.7, edgecolor='black')
+        ax5_res.axhline(0, color='black', linestyle='-', linewidth=1)
+        ax5_res.axhline(2, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        ax5_res.axhline(-2, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        ax5_res.set_xlim(ax5.get_xlim())
+        ax5_res.set_ylabel('Residuals\n$(O-E)/\\sqrt{E}$', fontsize=10)
+        ax5_res.set_xlabel('$|v_z|$ (m/s)', fontsize=12)
+        ax5_res.grid(True, alpha=0.3)
+
+    ax5.set_ylabel('Probability Density', fontsize=12)
+    ax5.set_title('$|v_z|$ (proj)', fontsize=13, fontweight='bold')
+    ax5.grid(True, alpha=0.3)
+    ax5.set_xticklabels([])
+
+    ax5_t = ax5.twiny()
+    x5lim = ax5.get_xlim()
+    ax5_t.set_xlim(x5lim[0] * 1e3, x5lim[1] * 1e3)
+    ax5_t.set_xlabel('$|v_z|$ (mm/s)', fontsize=11, color='orangered')
+    ax5_t.tick_params(axis='x', labelcolor='orangered')
+
+    # ============================================================
+    # 6) Polar rose plot: orientation + speed-weighted anisotropy
+    # ============================================================
+    # Streak orientations are in [0, 180) -- mirror to full circle for display.
+    n_angle_bins = 12
+    angle_bin_width_deg = 180.0 / n_angle_bins
+    angle_bin_width_rad = np.deg2rad(angle_bin_width_deg)
+
+    aniso_ratio = np.nan
+
+    if angles_valid.size > 0:
+        # Fold angles into [0, pi) -- orientation only
+        angles_folded = angles_valid % np.pi
+
+        # Bin edges over [0, pi)
+        angle_edges = np.linspace(0, np.pi, n_angle_bins + 1)
+        angle_centers = (angle_edges[:-1] + angle_edges[1:]) / 2.0
+
+        # Count histogram and speed-weighted histogram
+        count_hist, _ = np.histogram(angles_folded, bins=angle_edges)
+        speed_weighted = np.zeros(n_angle_bins)
+        for i in range(n_angle_bins):
+            mask = (angles_folded >= angle_edges[i]) & (angles_folded < angle_edges[i + 1])
+            if np.any(mask):
+                speed_weighted[i] = np.mean(v_mps[mask])
+
+        # Mirror to [pi, 2*pi) for symmetric display
+        count_hist_full = np.concatenate([count_hist, count_hist])
+        speed_weighted_full = np.concatenate([speed_weighted, speed_weighted])
+        angle_centers_full = np.concatenate([angle_centers, angle_centers + np.pi])
+
+        # Normalize count histogram to probability density
+        count_density = count_hist_full / (np.sum(count_hist) * angle_bin_width_rad)
+        uniform_level = 1.0 / np.pi  # expected density for uniform on [0, pi)
+
+        # Plot count rose
+        ax_polar.bar(angle_centers_full, count_density, width=angle_bin_width_rad,
+                     color='steelblue', alpha=0.5, edgecolor='black', linewidth=0.5,
+                     label='Count density')
+
+        # Uniform reference circle
+        theta_ref = np.linspace(0, 2 * np.pi, 200)
+        ax_polar.plot(theta_ref, np.full_like(theta_ref, uniform_level),
+                      'k--', lw=1.5, alpha=0.6, label='Uniform')
+
+        # Speed-weighted overlay (scaled to fit on same radial axis)
+        if np.max(speed_weighted_full) > 0:
+            # Scale speed values so max matches max of count density
+            speed_scale = np.max(count_density) / np.max(speed_weighted_full) if np.max(speed_weighted_full) > 0 else 1.0
+            speed_scaled = speed_weighted_full * speed_scale
+            ax_polar.bar(angle_centers_full, speed_scaled, width=angle_bin_width_rad,
+                         color='orangered', alpha=0.3, edgecolor='orangered', linewidth=0.5,
+                         label='Speed-weighted')
+
+        # Anisotropy ratio: max/min of count histogram (1.0 = isotropic)
+        if np.min(count_hist) > 0:
+            aniso_ratio = float(np.max(count_hist)) / float(np.min(count_hist))
+        else:
+            aniso_ratio = np.inf
+
+        ax_polar.set_title(f'Orientation Rose\naniso ratio = {aniso_ratio:.2f}',
+                           fontsize=13, fontweight='bold', pad=15)
+        ax_polar.legend(fontsize=8, loc='upper right', bbox_to_anchor=(1.3, 1.1))
+
+        # Label axes: 0° = horizontal (z), 90° = vertical (y)
+        ax_polar.set_theta_zero_location('E')  # 0° at right (horizontal)
+        ax_polar.set_theta_direction(-1)        # clockwise
+        ax_polar.set_thetagrids([0, 45, 90, 135, 180, 225, 270, 315],
+                                ['0° (z)', '45°', '90° (y)', '135°',
+                                 '180°', '225°', '270°', '315°'],
+                                fontsize=8)
+
     # Title and save/show
     total_droplets = int(lengths.size)
     fig.suptitle(
@@ -526,6 +782,20 @@ def analyze_independent(
             "sigma_fit_err_mps": sigma_err,
             "rayleigh_mean_predicted_mps": rayleigh_mean_predicted,
             "chi2_reduced": chi2_red_speed
+        },
+        "speed_y_proj": {
+            "sigma_fit_mps": sigma_y,
+            "sigma_fit_err_mps": sigma_y_err,
+            "chi2_reduced": chi2_red_vy
+        },
+        "speed_z_proj": {
+            "sigma_fit_mps": sigma_z,
+            "sigma_fit_err_mps": sigma_z_err,
+            "chi2_reduced": chi2_red_vz
+        },
+        "orientation": {
+            "anisotropy_ratio": aniso_ratio,
+            "n_angle_bins": n_angle_bins
         }
     }
     return results
@@ -664,6 +934,29 @@ if __name__ == "__main__":
         print(f"Rayleigh sigma:          {sigma_mps*1e3:.3f} mm/s")
     if np.isfinite(rayleigh_mean):
         print(f"Rayleigh predicted mean: {rayleigh_mean*1e3:.2f} mm/s")
+
+    # Projected speed components (half-normal fits)
+    vy_info = step1.get("speed_y_proj", {})
+    vz_info = step1.get("speed_z_proj", {})
+
+    sigma_y_mps = vy_info.get("sigma_fit_mps", np.nan)
+    chi2_vy = vy_info.get("chi2_reduced", np.nan)
+
+    sigma_z_mps = vz_info.get("sigma_fit_mps", np.nan)
+    chi2_vz = vz_info.get("chi2_reduced", np.nan)
+
+    if np.isfinite(sigma_y_mps):
+        chi2_str = f"  (chi2_red={chi2_vy:.2f})" if np.isfinite(chi2_vy) else ""
+        print(f"|v_y| (vertical):        sigma={sigma_y_mps*1e3:.3f} mm/s{chi2_str}")
+
+    if np.isfinite(sigma_z_mps):
+        chi2_str = f"  (chi2_red={chi2_vz:.2f})" if np.isfinite(chi2_vz) else ""
+        print(f"|v_z| (horizontal):      sigma={sigma_z_mps*1e3:.3f} mm/s{chi2_str}")
+
+    orient_info = step1.get("orientation", {})
+    aniso = orient_info.get("anisotropy_ratio", np.nan)
+    if np.isfinite(aniso):
+        print(f"Orientation anisotropy:   {aniso:.2f}  (max/min count ratio; 1.0 = isotropic)")
 
     print("\n--- Step 2 (Combined - placeholder) ---")
     resolved_mass  = step2['combined'].get('resolved_mass_kg', np.nan)
