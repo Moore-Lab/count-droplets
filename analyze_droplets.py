@@ -9,10 +9,33 @@ import cv2
 import numpy as np
 import argparse
 import json
+import os
+import datetime
+import tkinter as tk
+from tkinter import filedialog
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, TextBox
+
+
+def _get_project_root():
+    """Return the directory containing this script."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _get_data_dir(video_path):
+    """Return data/<basename>/ directory for a video."""
+    basename = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(_get_project_root(), "data", basename)
+
+
+def _get_logs_dir():
+    """Return the logs/ directory."""
+    return os.path.join(_get_project_root(), "logs")
+
+
 class DropletAnalyzer:
-    def __init__(self, video_path, start_time, end_time, x_start, x_stop, y_start, y_stop):
+    def __init__(self, video_path, start_time, end_time, x_start, x_stop, y_start, y_stop,
+                 fps_override=None, exposure_time_s=None):
         """
         Initialize the droplet analyzer.
 
@@ -20,10 +43,13 @@ class DropletAnalyzer:
             video_path: Path to the video file
             start_time: Start time in seconds
             end_time: End time in seconds
-            x_start: Left boundary of analysis region in Z (pixels)
-            x_stop: Right boundary of analysis region in Z (pixels)
-            y_start: Top boundary of analysis region in R (pixels)
-            y_stop: Bottom boundary of analysis region in R (pixels)
+            x_start: Left boundary of analysis region in R (pixels)
+            x_stop: Right boundary of analysis region in R (pixels)
+            y_start: Top boundary of analysis region in Z (pixels)
+            y_stop: Bottom boundary of analysis region in Z (pixels)
+            fps_override: Optional fps override (replaces video fps for time calculations)
+            exposure_time_s: Optional camera exposure time in seconds (for velocity calculation).
+                             If None, uses 1/fps as the exposure (frame period).
         """
         self.video_path = video_path
         self.start_time = start_time
@@ -32,6 +58,8 @@ class DropletAnalyzer:
         self.x_stop = x_stop
         self.y_start = y_start
         self.y_stop = y_stop
+        self.fps_override = fps_override
+        self.exposure_time_s = exposure_time_s
 
         self.cap = None
         self.fps = None
@@ -50,10 +78,17 @@ class DropletAnalyzer:
         if not self.cap.isOpened():
             raise ValueError(f"Could not open video file: {self.video_path}")
 
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        video_fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if self.fps_override is not None:
+            self.fps = float(self.fps_override)
+            print(f"  FPS (from video): {video_fps}")
+            print(f"  FPS (user override): {self.fps}")
+        else:
+            self.fps = video_fps
 
         print(f"Video opened: {self.video_path}")
         print(f"  Resolution: {self.frame_width}x{self.frame_height}")
@@ -64,17 +99,17 @@ class DropletAnalyzer:
     def validate_roi(self):
         """Validate the region of interest coordinates."""
         if self.x_start < 0 or self.x_stop > self.frame_width:
-            raise ValueError(f"Z coordinates must be within 0 and {self.frame_width}")
+            raise ValueError(f"R coordinates must be within 0 and {self.frame_width}")
         if self.y_start < 0 or self.y_stop > self.frame_height:
-            raise ValueError(f"R coordinates must be within 0 and {self.frame_height}")
+            raise ValueError(f"Z coordinates must be within 0 and {self.frame_height}")
         if self.x_start >= self.x_stop:
-            raise ValueError("Z start must be less than Z stop")
-        if self.y_start >= self.y_stop:
             raise ValueError("R start must be less than R stop")
+        if self.y_start >= self.y_stop:
+            raise ValueError("Z start must be less than Z stop")
 
         print(f"\nAnalysis region:")
-        print(f"  Z: {self.x_start} to {self.x_stop} (width: {self.x_stop - self.x_start})")
-        print(f"  R: {self.y_start} to {self.y_stop} (height: {self.y_stop - self.y_start})")
+        print(f"  R: {self.x_start} to {self.x_stop} (width: {self.x_stop - self.x_start})")
+        print(f"  Z: {self.y_start} to {self.y_stop} (height: {self.y_stop - self.y_start})")
 
     def view_frames_interactive(self, start_frame, end_frame, threshold=50, min_area=10, max_area=100):
         """
@@ -135,7 +170,7 @@ class DropletAnalyzer:
 
         # Create figure and axes
         fig, ax = plt.subplots(figsize=(12, 8))
-        plt.subplots_adjust(bottom=0.35)
+        plt.subplots_adjust(bottom=0.42)
 
         def calculate_sum_frame(analysis_only=True):
             """
@@ -307,7 +342,7 @@ class DropletAnalyzer:
 
                 # Calculate density using beam cross-sectional area
                 # Laser beam passes horizontally (right to left), so vertical ROI height = beam diameter
-                beam_radius_px = (self.y_stop - self.y_start) / 2
+                beam_radius_px = (self.x_stop - self.x_start) / 2
                 beam_cross_section = np.pi * beam_radius_px**2
                 density = droplet_count / beam_cross_section
 
@@ -374,8 +409,8 @@ class DropletAnalyzer:
                 ax.set_title(f"Frame: {frame_in_video}/{total_frames_in_video} | Time: {time_sec:.2f}s{detection_status}\n"
                             f"{roi_instruction}",
                             fontsize=14, fontweight='bold')
-            ax.set_xlabel(f"Z pixels", fontsize=10)
-            ax.set_ylabel(f"R pixels", fontsize=10)
+            ax.set_xlabel(f"R pixels", fontsize=10)
+            ax.set_ylabel(f"Z pixels", fontsize=10)
             ax.legend(loc='upper right')
 
             # Add text box with info
@@ -383,7 +418,7 @@ class DropletAnalyzer:
             roi_height = self.y_stop - self.y_start
             analysis_start_time = viewer_state['analysis_start_frame'] / self.fps
             analysis_end_time = viewer_state['analysis_end_frame'] / self.fps
-            info_text = (f"ROI: Z=[{self.x_start}, {self.x_stop}] R=[{self.y_start}, {self.y_stop}]\n"
+            info_text = (f"ROI: R=[{self.x_start}, {self.x_stop}] Z=[{self.y_start}, {self.y_stop}]\n"
                         f"Size: {roi_width} × {roi_height} px\n"
                         f"Analysis Range: {analysis_start_time:.2f}s to {analysis_end_time:.2f}s\n"
                         f"Analysis Frames: {viewer_state['analysis_start_frame']} to {viewer_state['analysis_end_frame']}\n"
@@ -396,12 +431,12 @@ class DropletAnalyzer:
 
             fig.canvas.draw_idle()
 
-        # Create frame navigation buttons (top row)
-        ax_back10 = plt.axes([0.15, 0.22, 0.08, 0.035])
-        ax_back1 = plt.axes([0.24, 0.22, 0.08, 0.035])
-        ax_fwd1 = plt.axes([0.33, 0.22, 0.08, 0.035])
-        ax_fwd10 = plt.axes([0.42, 0.22, 0.08, 0.035])
-        ax_textbox_frame = plt.axes([0.55, 0.22, 0.15, 0.035])
+        # Create frame navigation buttons (row 1)
+        ax_back10 = plt.axes([0.15, 0.29, 0.08, 0.035])
+        ax_back1 = plt.axes([0.24, 0.29, 0.08, 0.035])
+        ax_fwd1 = plt.axes([0.33, 0.29, 0.08, 0.035])
+        ax_fwd10 = plt.axes([0.42, 0.29, 0.08, 0.035])
+        ax_textbox_frame = plt.axes([0.55, 0.29, 0.15, 0.035])
 
         btn_back10 = Button(ax_back10, '<<< 10')
         btn_back1 = Button(ax_back1, '< 1')
@@ -409,35 +444,43 @@ class DropletAnalyzer:
         btn_fwd10 = Button(ax_fwd10, '10 >>>')
         textbox_frame = TextBox(ax_textbox_frame, 'Frame:', initial=str(start_frame))
 
-        # Create ROI coordinate input boxes (second row)
-        ax_x_start = plt.axes([0.15, 0.15, 0.10, 0.035])
-        ax_x_stop = plt.axes([0.27, 0.15, 0.10, 0.035])
-        ax_y_start = plt.axes([0.45, 0.15, 0.10, 0.035])
-        ax_y_stop = plt.axes([0.57, 0.15, 0.10, 0.035])
+        # Create ROI coordinate input boxes (row 2)
+        ax_x_start = plt.axes([0.15, 0.22, 0.10, 0.035])
+        ax_x_stop = plt.axes([0.27, 0.22, 0.10, 0.035])
+        ax_y_start = plt.axes([0.45, 0.22, 0.10, 0.035])
+        ax_y_stop = plt.axes([0.57, 0.22, 0.10, 0.035])
 
-        textbox_x_start = TextBox(ax_x_start, 'Z start:', initial=str(self.x_start))
-        textbox_x_stop = TextBox(ax_x_stop, 'Z stop:', initial=str(self.x_stop))
-        textbox_y_start = TextBox(ax_y_start, 'R start:', initial=str(self.y_start))
-        textbox_y_stop = TextBox(ax_y_stop, 'R stop:', initial=str(self.y_stop))
+        textbox_x_start = TextBox(ax_x_start, 'R start:', initial=str(self.x_start))
+        textbox_x_stop = TextBox(ax_x_stop, 'R stop:', initial=str(self.x_stop))
+        textbox_y_start = TextBox(ax_y_start, 'Z start:', initial=str(self.y_start))
+        textbox_y_stop = TextBox(ax_y_stop, 'Z stop:', initial=str(self.y_stop))
 
-        # Create detection parameter input boxes (third row)
-        ax_threshold = plt.axes([0.15, 0.08, 0.10, 0.035])
-        ax_min_area = plt.axes([0.27, 0.08, 0.10, 0.035])
-        ax_max_area = plt.axes([0.45, 0.08, 0.10, 0.035])
+        # Create detection parameter input boxes (row 3)
+        ax_threshold = plt.axes([0.15, 0.15, 0.10, 0.035])
+        ax_min_area = plt.axes([0.27, 0.15, 0.10, 0.035])
+        ax_max_area = plt.axes([0.45, 0.15, 0.10, 0.035])
 
         textbox_threshold = TextBox(ax_threshold, 'Threshold:', initial=str(threshold))
         textbox_min_area = TextBox(ax_min_area, 'Min area:', initial=str(min_area))
         textbox_max_area = TextBox(ax_max_area, 'Max area:', initial=str(max_area))
 
-        # Create time input boxes and buttons (bottom row)
-        ax_roi_button = plt.axes([0.02, 0.02, 0.09, 0.035])
-        ax_start_time = plt.axes([0.15, 0.02, 0.10, 0.035])
-        ax_end_time = plt.axes([0.27, 0.02, 0.10, 0.035])
-        ax_toggle_button = plt.axes([0.38, 0.02, 0.09, 0.035])
-        ax_sum_view_button = plt.axes([0.48, 0.02, 0.09, 0.035])
-        ax_sum_mode_button = plt.axes([0.58, 0.02, 0.09, 0.035])
-        ax_processed_button = plt.axes([0.78, 0.02, 0.10, 0.035])
-        ax_run_button = plt.axes([0.68, 0.02, 0.09, 0.035])
+        # FPS override and Exposure time boxes (row 3, right side)
+        fps_init = str(self.fps_override) if self.fps_override is not None else ""
+        exp_init = str(self.exposure_time_s) if self.exposure_time_s is not None else ""
+        ax_fps_override = plt.axes([0.62, 0.15, 0.10, 0.035])
+        ax_exposure = plt.axes([0.77, 0.15, 0.10, 0.035])
+        textbox_fps_override = TextBox(ax_fps_override, 'FPS ovr:', initial=fps_init)
+        textbox_exposure = TextBox(ax_exposure, 'Exp (s):', initial=exp_init)
+
+        # Create time input boxes and buttons (row 4)
+        ax_roi_button = plt.axes([0.02, 0.08, 0.09, 0.035])
+        ax_start_time = plt.axes([0.15, 0.08, 0.10, 0.035])
+        ax_end_time = plt.axes([0.27, 0.08, 0.10, 0.035])
+        ax_toggle_button = plt.axes([0.38, 0.08, 0.09, 0.035])
+        ax_sum_view_button = plt.axes([0.48, 0.08, 0.09, 0.035])
+        ax_sum_mode_button = plt.axes([0.58, 0.08, 0.09, 0.035])
+        ax_processed_button = plt.axes([0.78, 0.08, 0.10, 0.035])
+        ax_run_button = plt.axes([0.68, 0.08, 0.09, 0.035])
 
         btn_select_roi = Button(ax_roi_button, 'Select ROI')
         textbox_start_time = TextBox(ax_start_time, 'Start (s):', initial=f"{self.start_time:.1f}")
@@ -447,6 +490,12 @@ class DropletAnalyzer:
         btn_sum_mode = Button(ax_sum_mode_button, 'Analysis Only')
         btn_processed = Button(ax_processed_button, 'Show Processed')
         btn_run_analysis = Button(ax_run_button, 'Run Analysis')
+
+        # Load Log + Full Range buttons (row 5 / bottom)
+        ax_load_log_button = plt.axes([0.02, 0.02, 0.10, 0.035])
+        btn_load_log = Button(ax_load_log_button, 'Load Log')
+        ax_full_range_button = plt.axes([0.14, 0.02, 0.10, 0.035])
+        btn_full_range = Button(ax_full_range_button, 'Full Range')
 
         # Mouse event handlers for ROI selection
         def on_mouse_press(event):
@@ -563,12 +612,12 @@ class DropletAnalyzer:
                 new_val = int(text)
                 if 0 <= new_val < self.x_stop:
                     self.x_start = new_val
-                    print(f"Z start updated to {self.x_start}")
+                    print(f"R start updated to {self.x_start}")
                     # Invalidate analysis-only cache since ROI changed
                     viewer_state['sum_frame_cache'] = None
                     show_frame(viewer_state['current_frame'])
                 else:
-                    print(f"Invalid Z start: must be between 0 and {self.x_stop}")
+                    print(f"Invalid R start: must be between 0 and {self.x_stop}")
                     textbox_x_start.set_val(str(self.x_start))
             except ValueError:
                 print(f"Invalid Z start value: {text}")
@@ -579,12 +628,12 @@ class DropletAnalyzer:
                 new_val = int(text)
                 if self.x_start < new_val <= self.frame_width:
                     self.x_stop = new_val
-                    print(f"Z stop updated to {self.x_stop}")
+                    print(f"R stop updated to {self.x_stop}")
                     # Invalidate analysis-only cache since ROI changed
                     viewer_state['sum_frame_cache'] = None
                     show_frame(viewer_state['current_frame'])
                 else:
-                    print(f"Invalid Z stop: must be between {self.x_start} and {self.frame_width}")
+                    print(f"Invalid R stop: must be between {self.x_start} and {self.frame_width}")
                     textbox_x_stop.set_val(str(self.x_stop))
             except ValueError:
                 print(f"Invalid Z stop value: {text}")
@@ -595,15 +644,15 @@ class DropletAnalyzer:
                 new_val = int(text)
                 if 0 <= new_val < self.y_stop:
                     self.y_start = new_val
-                    print(f"R start updated to {self.y_start}")
+                    print(f"Z start updated to {self.y_start}")
                     # Invalidate analysis-only cache since ROI changed
                     viewer_state['sum_frame_cache'] = None
                     show_frame(viewer_state['current_frame'])
                 else:
-                    print(f"Invalid R start: must be between 0 and {self.y_stop}")
+                    print(f"Invalid Z start: must be between 0 and {self.y_stop}")
                     textbox_y_start.set_val(str(self.y_start))
             except ValueError:
-                print(f"Invalid R start value: {text}")
+                print(f"Invalid Z start value: {text}")
                 textbox_y_start.set_val(str(self.y_start))
 
         def update_y_stop(text):
@@ -611,15 +660,15 @@ class DropletAnalyzer:
                 new_val = int(text)
                 if self.y_start < new_val <= self.frame_height:
                     self.y_stop = new_val
-                    print(f"R stop updated to {self.y_stop}")
+                    print(f"Z stop updated to {self.y_stop}")
                     # Invalidate analysis-only cache since ROI changed
                     viewer_state['sum_frame_cache'] = None
                     show_frame(viewer_state['current_frame'])
                 else:
-                    print(f"Invalid R stop: must be between {self.y_start} and {self.frame_height}")
+                    print(f"Invalid Z stop: must be between {self.y_start} and {self.frame_height}")
                     textbox_y_stop.set_val(str(self.y_stop))
             except ValueError:
-                print(f"Invalid R stop value: {text}")
+                print(f"Invalid Z stop value: {text}")
                 textbox_y_stop.set_val(str(self.y_stop))
 
         def update_start_time(text):
@@ -806,7 +855,121 @@ class DropletAnalyzer:
             print(f"Final settings:")
             print(f"  Time range: {self.start_time:.2f}s to {self.end_time:.2f}s")
             print(f"  ROI: Z=[{self.x_start}, {self.x_stop}] R=[{self.y_start}, {self.y_stop}]")
+            if self.fps_override is not None:
+                print(f"  FPS override: {self.fps_override}")
+            if self.exposure_time_s is not None:
+                print(f"  Exposure time: {self.exposure_time_s:.6f} s")
             plt.close(fig)
+
+        def update_fps_override(text):
+            text = text.strip()
+            if text == "":
+                self.fps_override = None
+                print("FPS override cleared; will use video fps.")
+            else:
+                try:
+                    val = float(text)
+                    if val > 0:
+                        self.fps_override = val
+                        self.fps = val
+                        print(f"FPS override set to {self.fps_override}")
+                    else:
+                        print("FPS override must be positive.")
+                        textbox_fps_override.set_val(str(self.fps_override) if self.fps_override else "")
+                except ValueError:
+                    print(f"Invalid FPS value: {text}")
+                    textbox_fps_override.set_val(str(self.fps_override) if self.fps_override else "")
+
+        def update_exposure(text):
+            text = text.strip()
+            if text == "":
+                self.exposure_time_s = None
+                print("Exposure cleared; will use 1/fps as exposure time for velocity.")
+            else:
+                try:
+                    val = float(text)
+                    if val > 0:
+                        self.exposure_time_s = val
+                        print(f"Exposure time set to {self.exposure_time_s:.6f} s")
+                    else:
+                        print("Exposure time must be positive.")
+                        textbox_exposure.set_val(str(self.exposure_time_s) if self.exposure_time_s else "")
+                except ValueError:
+                    print(f"Invalid exposure value: {text}")
+                    textbox_exposure.set_val(str(self.exposure_time_s) if self.exposure_time_s else "")
+
+        def load_log_callback(_):
+            """Load parameters from a log file and populate the GUI."""
+            root = tk.Tk()
+            root.withdraw()
+            logs_dir = _get_logs_dir()
+            log_path = filedialog.askopenfilename(
+                title="Load Analysis Log",
+                initialdir=logs_dir if os.path.isdir(logs_dir) else _get_project_root(),
+                filetypes=[("JSON log files", "*.json"), ("All files", "*.*")]
+            )
+            root.destroy()
+            if not log_path:
+                return
+            try:
+                with open(log_path, 'r') as f:
+                    log = json.load(f)
+                params = log.get("analysis_parameters", {})
+                # Time range
+                if 'start_time' in params:
+                    self.start_time = float(params['start_time'])
+                    textbox_start_time.set_val(f"{self.start_time:.1f}")
+                    viewer_state['analysis_start_frame'] = int(self.start_time * self.fps)
+                if 'end_time' in params:
+                    self.end_time = float(params['end_time'])
+                    textbox_end_time.set_val(f"{self.end_time:.1f}")
+                    viewer_state['analysis_end_frame'] = min(int(self.end_time * self.fps),
+                                                             viewer_state['end_frame'])
+                # ROI
+                if 'x_start' in params:
+                    self.x_start = int(params['x_start'])
+                    textbox_x_start.set_val(str(self.x_start))
+                if 'x_stop' in params:
+                    self.x_stop = int(params['x_stop'])
+                    textbox_x_stop.set_val(str(self.x_stop))
+                if 'y_start' in params:
+                    self.y_start = int(params['y_start'])
+                    textbox_y_start.set_val(str(self.y_start))
+                if 'y_stop' in params:
+                    self.y_stop = int(params['y_stop'])
+                    textbox_y_stop.set_val(str(self.y_stop))
+                # Detection parameters
+                if 'threshold' in params:
+                    viewer_state['threshold'] = int(params['threshold'])
+                    textbox_threshold.set_val(str(viewer_state['threshold']))
+                if 'min_area' in params:
+                    viewer_state['min_area'] = int(params['min_area'])
+                    textbox_min_area.set_val(str(viewer_state['min_area']))
+                if 'max_area' in params:
+                    viewer_state['max_area'] = int(params['max_area'])
+                    textbox_max_area.set_val(str(viewer_state['max_area']))
+                # FPS override
+                fps_ov = params.get('fps_override')
+                if fps_ov is not None:
+                    self.fps_override = float(fps_ov)
+                    self.fps = self.fps_override
+                    textbox_fps_override.set_val(str(self.fps_override))
+                else:
+                    textbox_fps_override.set_val("")
+                # Exposure
+                exp = params.get('exposure_time_s')
+                if exp is not None:
+                    self.exposure_time_s = float(exp)
+                    textbox_exposure.set_val(str(self.exposure_time_s))
+                else:
+                    textbox_exposure.set_val("")
+                # Invalidate caches
+                viewer_state['sum_frame_cache'] = None
+                viewer_state['sum_frame_cache_full'] = None
+                print(f"Log loaded: {log_path}")
+                show_frame(viewer_state['current_frame'])
+            except Exception as e:
+                print(f"Error loading log: {e}")
 
         # Connect callbacks
         btn_back10.on_clicked(backward_10)
@@ -824,6 +987,9 @@ class DropletAnalyzer:
         textbox_min_area.on_submit(update_min_area)
         textbox_max_area.on_submit(update_max_area)
 
+        textbox_fps_override.on_submit(update_fps_override)
+        textbox_exposure.on_submit(update_exposure)
+
         textbox_start_time.on_submit(update_start_time)
         textbox_end_time.on_submit(update_end_time)
         btn_select_roi.on_clicked(select_roi_callback)
@@ -832,6 +998,25 @@ class DropletAnalyzer:
         btn_sum_mode.on_clicked(toggle_sum_mode_callback)
         btn_processed.on_clicked(toggle_processed_callback)
         btn_run_analysis.on_clicked(run_analysis_callback)
+        btn_load_log.on_clicked(load_log_callback)
+
+        def full_range_callback(_):
+            """Set analysis time range to cover all frames in the video."""
+            self.start_time = 0.0
+            # Use total_frames / fps — works regardless of whether fps is correct,
+            # because the frame count is always exact and the time inputs merely
+            # select which frames to include.
+            self.end_time = self.total_frames / self.fps
+            viewer_state['analysis_start_frame'] = 0
+            viewer_state['analysis_end_frame'] = self.total_frames
+            viewer_state['sum_frame_cache'] = None
+            textbox_start_time.set_val(f"{self.start_time:.1f}")
+            textbox_end_time.set_val(f"{self.end_time:.1f}")
+            print(f"Full range set: 0.0 s to {self.end_time:.2f} s "
+                  f"(frames 0 – {self.total_frames})")
+            show_frame(viewer_state['current_frame'])
+
+        btn_full_range.on_clicked(full_range_callback)
 
         # Show initial frame
         show_frame(start_frame)
@@ -1062,6 +1247,11 @@ class DropletAnalyzer:
             print(f"  Max area: {max_area} pixels")
             print()
 
+        # Store final detection parameters on instance so save_log() can use them
+        self.threshold = threshold
+        self.min_area = min_area
+        self.max_area = max_area
+
         # Set video to start frame
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
@@ -1188,7 +1378,7 @@ class DropletAnalyzer:
                    'b-', linewidth=1.5, alpha=0.7)
 
         # Calculate density using beam cross-sectional area (π*r² where 2r = vertical ROI height)
-        beam_radius_px = (self.y_stop - self.y_start) / 2
+        beam_radius_px = (self.x_stop - self.x_start) / 2
         beam_cross_section = np.pi * beam_radius_px**2
         density = droplet_count / beam_cross_section if beam_cross_section > 0 else 0
 
@@ -1199,8 +1389,8 @@ class DropletAnalyzer:
                     fontsize=14, fontweight='bold', pad=20)
 
         # Add axes labels
-        ax.set_xlabel("Z (pixels)", fontsize=12)
-        ax.set_ylabel("R (pixels)", fontsize=12)
+        ax.set_xlabel("R (pixels)", fontsize=12)
+        ax.set_ylabel("Z (pixels)", fontsize=12)
 
         # Add legend
         ax.legend(loc='upper right', fontsize=11)
@@ -1208,8 +1398,8 @@ class DropletAnalyzer:
         # Add info box with ROI coordinates
         info_text = (
             f"ROI Coordinates:\n"
-            f"  Z: {self.x_start} → {self.x_stop}\n"
-            f"  R: {self.y_start} → {self.y_stop}\n"
+            f"  R: {self.x_start} → {self.x_stop}\n"
+            f"  Z: {self.y_start} → {self.y_stop}\n"
             f"  Area: {(self.x_stop - self.x_start) * (self.y_stop - self.y_start):,} px²"
         )
         ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
@@ -1252,15 +1442,15 @@ class DropletAnalyzer:
         roi_height = self.y_stop - self.y_start
         roi_area_px2 = roi_width * roi_height
 
-        # Spatial ROI as cylindrical beam cross-section (π*r² where 2r = vertical ROI height)
-        roi_beam_radius_px = roi_height / 2
+        # Spatial ROI as cylindrical beam cross-section (π*r² where 2r = horizontal ROI width = R extent)
+        roi_beam_radius_px = roi_width / 2
         roi_beam_cross_section_px2 = np.pi * roi_beam_radius_px**2
 
         # Full frame area
         full_frame_area_px2 = frame_width * frame_height
 
-        # Full frame as cylindrical beam cross-section (π*r² where 2r = frame height)
-        full_beam_radius_px = frame_height / 2
+        # Full frame as cylindrical beam cross-section (π*r² where 2r = frame width = R extent)
+        full_beam_radius_px = frame_width / 2
         full_beam_cross_section_px2 = np.pi * full_beam_radius_px**2
 
         # Extract counts from frame data
@@ -1390,9 +1580,26 @@ class DropletAnalyzer:
 
         print("="*70)
 
-    def save_results(self, output_path):
-        """Save results to JSON file."""
+    def get_data_dir(self):
+        """Return the data/<basename>/ directory for this video (creates it if needed)."""
+        d = _get_data_dir(self.video_path)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def get_data_basename(self):
+        """Return the video file basename (without extension)."""
+        return os.path.splitext(os.path.basename(self.video_path))[0]
+
+    def save_results(self, output_path=None):
+        """Save results to JSON file.
+
+        If output_path is None, saves to data/<basename>/<basename>_test_results.json.
+        """
         results = self.calculate_statistics()
+
+        if output_path is None:
+            basename = self.get_data_basename()
+            output_path = os.path.join(self.get_data_dir(), f"{basename}_test_results.json")
 
         # Add metadata
         full_results = {
@@ -1410,10 +1617,11 @@ class DropletAnalyzer:
                 'frame_height': self.frame_height,
                 # Pixel calibration
                 'pixels_per_um': 0.1878,
-                'fps': self.fps
+                'fps': self.fps,
+                'fps_override': self.fps_override,
+                'exposure_time_s': self.exposure_time_s
             },
-            'results': results,
-            'frame_data': self.frame_data
+            'results': results
         }
 
         with open(output_path, 'w') as f:
@@ -1423,7 +1631,62 @@ class DropletAnalyzer:
 
         return results
 
-    def save_droplet_data_numpy(self, output_path):
+    def save_log(self, threshold=None, min_area=None, max_area=None):
+        """Save analysis parameters to a timestamped log file in logs/.
+
+        Creates logs/<basename>_<YYYY-MM-DD_HH-MM-SS>.json.
+        Returns the log file path.
+        """
+        logs_dir = _get_logs_dir()
+        os.makedirs(logs_dir, exist_ok=True)
+
+        basename = self.get_data_basename()
+        data_dir = self.get_data_dir()
+        now = datetime.datetime.now()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+        log_filename = f"{basename}_{timestamp}.json"
+        log_path = os.path.join(logs_dir, log_filename)
+
+        # Use instance-stored values (set by analyze()) if not provided explicitly
+        if threshold is None:
+            threshold = getattr(self, 'threshold', None)
+        if min_area is None:
+            min_area = getattr(self, 'min_area', None)
+        if max_area is None:
+            max_area = getattr(self, 'max_area', None)
+
+        log = {
+            'video_path': str(self.video_path),
+            'video_basename': basename,
+            'analysis_datetime': now.isoformat(),
+            'analysis_parameters': {
+                'start_time': self.start_time,
+                'end_time': self.end_time,
+                'x_start': self.x_start,
+                'x_stop': self.x_stop,
+                'y_start': self.y_start,
+                'y_stop': self.y_stop,
+                'threshold': threshold,
+                'min_area': min_area,
+                'max_area': max_area,
+                'fps': self.fps,
+                'fps_override': self.fps_override,
+                'exposure_time_s': self.exposure_time_s,
+                'pixels_per_um': 0.1878,
+            },
+            'data_dir': data_dir,
+            'droplet_data_path': os.path.join(data_dir, f"{basename}_droplet_data.npy"),
+            'tracking_data_path': os.path.join(data_dir, f"{basename}_tracking_data.npy"),
+            'results_json_path': os.path.join(data_dir, f"{basename}_test_results.json"),
+        }
+
+        with open(log_path, 'w') as f:
+            json.dump(log, f, indent=2)
+
+        print(f"\nAnalysis log saved to: {log_path}")
+        return log_path
+
+    def save_droplet_data_numpy(self, output_path=None):
         """
         Save per-droplet data to a numpy binary file.
 
@@ -1435,8 +1698,12 @@ class DropletAnalyzer:
         frame, droplet_id, x, y, length, width, angle.
 
         Args:
-            output_path: Path to save the .npy file
+            output_path: Path to save the .npy file. If None, saves to
+                         data/<basename>/<basename>_droplet_data.npy.
         """
+        if output_path is None:
+            basename = self.get_data_basename()
+            output_path = os.path.join(self.get_data_dir(), f"{basename}_droplet_data.npy")
         if not self.frame_data:
             raise ValueError("No data to save. Run analyze() first.")
 
@@ -1482,7 +1749,7 @@ class DropletAnalyzer:
 
         return droplet_array
 
-    def save_tracking_data_numpy(self, output_path):
+    def save_tracking_data_numpy(self, output_path=None):
         """
         Save per-droplet tracking data to a numpy binary file.
 
@@ -1495,8 +1762,12 @@ class DropletAnalyzer:
         length_start/end (x,y), width_start/end (x,y).
 
         Args:
-            output_path: Path to save the .npy file
+            output_path: Path to save the .npy file. If None, saves to
+                         data/<basename>/<basename>_tracking_data.npy.
         """
+        if output_path is None:
+            basename = self.get_data_basename()
+            output_path = os.path.join(self.get_data_dir(), f"{basename}_tracking_data.npy")
         if not self.frame_data:
             raise ValueError("No data to save. Run analyze() first.")
 
@@ -1605,12 +1876,12 @@ Example usage:
     parser.add_argument('--end-time', type=float, help='End time in seconds')
     parser.add_argument('-x', '--x-range', nargs=2, type=int, metavar=('START', 'STOP'),
                         help='Z (horizontal) coordinate range in pixels (e.g., -x 100 500)')
-    parser.add_argument('--x-start', type=int, help='Z start coordinate')
-    parser.add_argument('--x-stop', type=int, help='Z stop coordinate')
+    parser.add_argument('--x-start', type=int, help='R start coordinate')
+    parser.add_argument('--x-stop', type=int, help='R stop coordinate')
     parser.add_argument('-y', '--y-range', nargs=2, type=int, metavar=('START', 'STOP'),
                         help='R (vertical) coordinate range in pixels (e.g., -y 50 400)')
-    parser.add_argument('--y-start', type=int, help='R start coordinate')
-    parser.add_argument('--y-stop', type=int, help='R stop coordinate')
+    parser.add_argument('--y-start', type=int, help='Z start coordinate')
+    parser.add_argument('--y-stop', type=int, help='Z stop coordinate')
     parser.add_argument('--threshold', type=int, default=50,
                         help='Brightness threshold for droplet detection (default: 50)')
     parser.add_argument('--min-area', type=int, default=10,
@@ -1689,22 +1960,26 @@ if __name__ == '__main__':
     # To use command line arguments instead, comment out this block and uncomment main()
 
     # Test parameters
-    TEST_VIDEO = "260115174302.mp4"  # Change this to your video file
-    TEST_VIDEO = "water_100.mp4"
-    TEST_START_TIME = 5.0  # seconds
-    TEST_END_TIME = 10.0   # seconds
-    TEST_X_START = 100     # pixels
-    TEST_X_STOP = 500      # pixels
-    TEST_Y_START = 50      # pixels
-    TEST_Y_STOP = 400      # pixels
+    TEST_VIDEO = r"D:\Xenon Microsphere\count-droplets\videos\3-7-2026\xenon_fill_3_3-7-2026.avi"
+    #TEST_VIDEO = "260115174302.mp4"
+    TEST_START_TIME = 5.0   # seconds
+    TEST_END_TIME = 10.0    # seconds
+    TEST_X_START = 100      # pixels
+    TEST_X_STOP = 500       # pixels
+    TEST_Y_START = 50       # pixels
+    TEST_Y_STOP = 400       # pixels
 
-    # Detection parameters (optional)
+    # Detection parameters
     TEST_THRESHOLD = 50
     TEST_MIN_AREA = 10
     TEST_MAX_AREA = 100
     TEST_VIEW_FRAMES = True  # Set to True to preview frames before analysis
 
-    # Create analyzer with test parameters
+    # Optional: override fps or exposure time
+    TEST_FPS_OVERRIDE = None       # e.g. 30.0 — set to None to use video fps
+    TEST_EXPOSURE_TIME_S = None    # e.g. 0.001 — set to None to use 1/fps
+
+    # Create analyzer
     analyzer = DropletAnalyzer(
         video_path=TEST_VIDEO,
         start_time=TEST_START_TIME,
@@ -1712,7 +1987,9 @@ if __name__ == '__main__':
         x_start=TEST_X_START,
         x_stop=TEST_X_STOP,
         y_start=TEST_Y_START,
-        y_stop=TEST_Y_STOP
+        y_stop=TEST_Y_STOP,
+        fps_override=TEST_FPS_OVERRIDE,
+        exposure_time_s=TEST_EXPOSURE_TIME_S
     )
 
     # Run analysis
@@ -1722,22 +1999,33 @@ if __name__ == '__main__':
         max_area=TEST_MAX_AREA,
         view_frames=TEST_VIEW_FRAMES
     )
-    # Save per-droplet data to numpy binary file
-    analyzer.save_droplet_data_numpy('droplet_data.npy')
 
-    # Optionally save results to JSON
-    analyzer.save_results('test_results.json')
+    # Compute data paths
+    _basename = analyzer.get_data_basename()
+    _data_dir = analyzer.get_data_dir()   # also creates the directory
+    droplet_data_path = os.path.join(_data_dir, f"{_basename}_droplet_data.npy")
+    results_json_path = os.path.join(_data_dir, f"{_basename}_test_results.json")
+
+    # Save per-droplet data (goes to data/<basename>/<basename>_droplet_data.npy)
+    analyzer.save_droplet_data_numpy(droplet_data_path)
+
+    # Save results JSON (goes to data/<basename>/<basename>_test_results.json)
+    analyzer.save_results(results_json_path)
+
+    # Save analysis log (goes to logs/<basename>_<timestamp>.json)
+    # Parameters are read from analyzer.threshold/min_area/max_area set by analyze()
+    analyzer.save_log()
 
     # Use analyze_distributions for all statistics and plotting
     import analyze_distributions
-    per_droplet = analyze_distributions.load_droplet_data('droplet_data.npy', results_json='test_results.json')
-    # Step 1: Independent analysis + plots (density fixed at 3520 kg/m^3 by default)
+    per_droplet = analyze_distributions.load_droplet_data(
+        droplet_data_path, results_json=results_json_path
+    )
     step1 = analyze_distributions.analyze_independent(
         per_droplet,
         density_kg_m3=3520.0,
         save_path=None
     )
-    # Step 2: Combined analysis (scaffold)
     step2 = analyze_distributions.analyze_combined(step1, per_droplet)
 
     # Uncomment to use command line arguments instead:

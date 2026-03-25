@@ -893,10 +893,19 @@ def main(
     data = load_tracking_data(input_file)
 
     if max_distance is None:
+        import os as _os
         n_droplets = []
         for i in range(75):
-            n = main(max_distance=i, plot_tracks=False)
+            n = main(input_file=input_file, max_distance=i, plot_tracks=False)
             n_droplets.append(n)
+
+        # Save the scan results alongside the data file
+        _dv_dir = _os.path.dirname(_os.path.abspath(input_file))
+        _dv_base = _os.path.splitext(_os.path.basename(input_file))[0]
+        if _dv_base.endswith("_droplet_data"):
+            _dv_base = _dv_base[: -len("_droplet_data")]
+        _dv_path = _os.path.join(_dv_dir, f"{_dv_base}_droplets_vs_distance.npy")
+        np.save(_dv_path, np.array(n_droplets, dtype=np.int32))
 
         import set_distance_threshold as sdt
         best_threshold, n_tracked = sdt.plot_droplets_vs_distance(
@@ -968,15 +977,22 @@ def main(
                 save_path=summed_save_path
             )
 
-    # Save track data for downstream analysis
-    save_track_data(endpoints_by_track, "track_data.npz",
+    # Save track data alongside the droplet data file
+    import os as _os
+    _data_dir = _os.path.dirname(_os.path.abspath(input_file))
+    _basename = _os.path.splitext(_os.path.basename(input_file))[0]
+    # Strip _droplet_data suffix if present, then append _track_data
+    if _basename.endswith("_droplet_data"):
+        _basename = _basename[: -len("_droplet_data")]
+    track_npz_path = _os.path.join(_data_dir, f"{_basename}_track_data.npz")
+    save_track_data(endpoints_by_track, track_npz_path,
                     fps=fps, pixels_per_um=pixels_per_um,
                     max_distance=max_distance,
                     min_track_length=min_track_length)
 
     # Run track-based analysis
     import analyze_tracks
-    track_data = analyze_tracks.load_track_data("track_data.npz")
+    track_data = analyze_tracks.load_track_data(track_npz_path)
     analyze_tracks.analyze_tracks(track_data)
 
     return endpoints_by_track
@@ -984,8 +1000,12 @@ def main(
 
 if __name__ == "__main__":
     # === USER SETTINGS ===
-    input_file = "droplet_data.npy"
-    video_path = "260115174302.mp4"  # Path to video file
+    # Update VIDEO_BASENAME to match your video filename (without extension)
+    VIDEO_BASENAME = "water_constexp2"
+    import os
+    _root = os.path.dirname(os.path.abspath(__file__))
+    input_file = os.path.join(_root, "data", VIDEO_BASENAME, f"{VIDEO_BASENAME}_droplet_data.npy")
+    video_path = None  # Path to video file (optional, for summed track visualization)
     canvas = (1920, 1080)
     invert_y = True           # image-like coordinates (origin top-left)
     max_distance = 24         # linking radius in pixels

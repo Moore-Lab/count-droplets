@@ -1,1 +1,12 @@
 *.mp4
+*.avi
+*.tif
+*.pyc
+*.json
+*.npz
+*.npy
+*.png
+*.log
+*.csv
+__pycache__/*
+.claude/*

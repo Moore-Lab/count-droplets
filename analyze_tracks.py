@@ -463,5 +463,12 @@ def analyze_tracks(
 # =============================================================================
 
 if __name__ == "__main__":
-    track_data = load_track_data("track_data.npz")
+    # === USER SETTINGS ===
+    # Update VIDEO_BASENAME to match your video filename (without extension)
+    VIDEO_BASENAME = "water_constexp2"
+    import os as _os
+    _root = _os.path.dirname(_os.path.abspath(__file__))
+    track_file = _os.path.join(_root, "data", VIDEO_BASENAME, f"{VIDEO_BASENAME}_track_data.npz")
+
+    track_data = load_track_data(track_file)
     results = analyze_tracks(track_data)

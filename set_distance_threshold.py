@@ -242,5 +242,13 @@ def plot_droplets_vs_distance(data=None, filename="droplets_vs_distance.npy", sh
 
 
 if __name__ == "__main__":
-    best_threshold, n_tracked = plot_droplets_vs_distance(fit_mode="joint", k_sigma=2.0, two_sided=False)
+    # === USER SETTINGS ===
+    VIDEO_BASENAME = "water_constexp2"
+    import os as _os
+    _root = _os.path.dirname(_os.path.abspath(__file__))
+    _filename = _os.path.join(_root, "data", VIDEO_BASENAME, f"{VIDEO_BASENAME}_droplets_vs_distance.npy")
+
+    best_threshold, n_tracked = plot_droplets_vs_distance(
+        filename=_filename, fit_mode="joint", k_sigma=2.0, two_sided=False
+    )
     print(f"Suggested best threshold: {best_threshold} (tracks {n_tracked} droplets)")

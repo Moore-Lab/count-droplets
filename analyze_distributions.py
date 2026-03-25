@@ -86,13 +86,42 @@ def load_droplet_data(filepath: str, results_json: Optional[str] = None) -> Dict
     widths  = D['width']
     angles  = D['angle']
 
-    unique_frames, counts_per_frame = np.unique(frames, return_counts=True)
+    # Build per-frame counts from just the detected droplets (fallback, no zeros)
+    unique_frames, counts_no_zeros = np.unique(frames, return_counts=True)
+
     metadata: Dict[str, Any] = {}
     if results_json is not None:
         with open(results_json, "r") as f:
             summary = json.load(f)
         metadata = summary.get("analysis_parameters", {})
         metadata.update(summary.get("results", {}))
+
+    # Reconstruct full frame range including zero-count frames.
+    # This requires start_time, end_time, and fps from the metadata.
+    # Zero-count frames are included in counts so the Poisson fit is unbiased;
+    # lengths/widths/angles are unaffected (they come from actual detections only).
+    start_time = metadata.get('start_time')
+    end_time   = metadata.get('end_time')
+    fps        = metadata.get('fps')
+
+    if start_time is not None and end_time is not None and fps is not None:
+        start_frame = int(float(start_time) * float(fps))
+        end_frame   = int(float(end_time)   * float(fps))
+        n_total     = end_frame - start_frame
+
+        if n_total > 0:
+            counts_per_frame = np.zeros(n_total, dtype=np.int64)
+            for f, c in zip(unique_frames, counts_no_zeros):
+                idx = int(f) - start_frame
+                if 0 <= idx < n_total:
+                    counts_per_frame[idx] = c
+            metadata["frames_analyzed"] = n_total
+        else:
+            counts_per_frame = counts_no_zeros
+            metadata["frames_analyzed"] = int(len(unique_frames))
+    else:
+        # No frame-range info available — fall back to dropping zero frames
+        counts_per_frame = counts_no_zeros
         metadata["frames_analyzed"] = int(len(unique_frames))
 
     return {
@@ -234,8 +263,8 @@ def analyze_independent(
         if (roi_w_px <= 0) and (per_droplet.get('x') is not None) and (per_droplet['x'].size > 0):
             roi_w_px = int(np.max(per_droplet['x']) - np.min(per_droplet['x']) + 1)
 
-        r_used_mm = 0.5 * roi_h_px * mm_per_px
-        z_used_mm = 1.0 * roi_w_px * mm_per_px
+        r_used_mm = 0.5 * roi_w_px * mm_per_px  # R = horizontal = x extent
+        z_used_mm = 1.0 * roi_h_px * mm_per_px  # Z = vertical   = y extent
         volume_mm3 = float(np.pi * (r_used_mm ** 2) * z_used_mm)
         volume_source = "roi_pixels_to_mm"
 
@@ -504,15 +533,18 @@ def analyze_independent(
     ax3_t.tick_params(axis='x', labelcolor='darkgreen')
 
     # ============================================================
-    # 4) Projected speed: y (vertical) - Half-normal fit + residuals
+    # 4) Projected speed: R (horizontal) - Half-normal fit + residuals
     # ============================================================
     # Streak angle gives orientation only (no direction), so projections
-    # are unsigned magnitudes: |v * sin(angle)|, |v * cos(angle)|.
+    # are unsigned magnitudes. Z=vertical=sin, R=horizontal=cos.
     angles_valid = np.deg2rad(angles[valid_len_mask])
-    v_y = np.abs(v_mps * np.sin(angles_valid))  # vertical projection (magnitude)
-    v_z = np.abs(v_mps * np.cos(angles_valid))  # horizontal projection (magnitude)
+    v_z = np.abs(v_mps * np.sin(angles_valid))  # Z = vertical   = sin component
+    v_r = np.abs(v_mps * np.cos(angles_valid))  # R = horizontal = cos component
 
-    # --- y projection ---
+    # Alias for downstream variable names (ax4 plots v_r, ax5 plots v_z)
+    v_y = v_r
+
+    # --- r projection (ax4) ---
     sigma_y, sigma_y_err = np.nan, np.nan
     chi2_red_vy = np.nan
 
@@ -580,7 +612,7 @@ def analyze_independent(
     ax4_t.tick_params(axis='x', labelcolor='purple')
 
     # ============================================================
-    # 5) Projected speed: z (horizontal) - Half-normal fit + residuals
+    # 5) Projected speed: Z (vertical) - Half-normal fit + residuals
     # ============================================================
     sigma_z, sigma_z_err = np.nan, np.nan
     chi2_red_vz = np.nan
@@ -832,8 +864,13 @@ def analyze_combined(
 # =============================================================================
 
 if __name__ == "__main__":
-    data_file = "droplet_data.npy"
-    results_json = "test_results.json"
+    # === USER SETTINGS ===
+    # Update VIDEO_BASENAME to match your video filename (without extension)
+    VIDEO_BASENAME = "water_constexp2"
+    import os
+    _root = os.path.dirname(os.path.abspath(__file__))
+    data_file = os.path.join(_root, "data", VIDEO_BASENAME, f"{VIDEO_BASENAME}_droplet_data.npy")
+    results_json = os.path.join(_root, "data", VIDEO_BASENAME, f"{VIDEO_BASENAME}_test_results.json")
     save_plot_step1 = None
 
     print(f"[load] Loading droplet data from: {data_file}")
